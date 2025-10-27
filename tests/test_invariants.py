@@ -7,6 +7,10 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from totem import (
     EFFECT_GRADES,
+    build_bitcode_document,
+    evaluate_scope,
+    structural_decompress,
+    verify_bitcode_document,
     build_tir,
     compute_tir_distance,
     continuous_semantics_profile,
@@ -44,6 +48,17 @@ def compute_expected_grade(scope):
     return idx
 
 
+def find_first_node_dict(scope_dict):
+    nodes = scope_dict.get("nodes", [])
+    if nodes:
+        return nodes[0]
+    for child in scope_dict.get("children", []):
+        candidate = find_first_node_dict(child)
+        if candidate:
+            return candidate
+    return None
+
+
 @pytest.fixture
 def sample_root():
     return structural_decompress("{a{bc}de{fg}}")
@@ -76,6 +91,32 @@ def test_root_grade_matches_max_child(sample_root):
     assert result.grade == EFFECT_GRADES[expected_idx]
 
 
+def test_bitcode_includes_certificates(sample_root):
+    result = evaluate_scope(sample_root)
+    doc = build_bitcode_document(sample_root, result)
+
+    assert "certificates" in doc
+    alias_cert = doc["certificates"]["aliasing"]
+    grade_cert = doc["certificates"]["grades"]
+
+    assert alias_cert["ok"]
+    assert grade_cert["ok"]
+
+    # Machine-checkable verification passes for untampered bitcode.
+    assert verify_bitcode_document(doc) is True
+
+
+def test_certificate_verification_detects_tampering(sample_root):
+    result = evaluate_scope(sample_root)
+    doc = build_bitcode_document(sample_root, result)
+
+    # Mutate a node grade without updating certificates.
+    first_node = find_first_node_dict(doc["root_scope"])
+    assert first_node is not None
+    first_node["grade"] = EFFECT_GRADES[-1]
+
+    with pytest.raises(ValueError):
+        verify_bitcode_document(doc)
 def build_tir_from_src(src):
     return build_tir(structural_decompress(src))
 
