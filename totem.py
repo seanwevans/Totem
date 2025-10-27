@@ -33,6 +33,28 @@ import heapq
 import json
 from pathlib import Path
 import sys
+try:
+    import networkx as nx
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    nx = None
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    plt = None
+
+try:
+    import pydot
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pydot = None
+
+try:
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidSignature
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
 
@@ -52,6 +74,7 @@ OPS = {
     "E": {"grade": "pure"},
     "F": {"grade": "pure"},
     "G": {"grade": "io"},
+    "P": {"grade": "pure"},  # pattern match (pure control flow)
 }
 
 LOGBOOK_FILE = "totem.logbook.jsonl"
@@ -71,6 +94,16 @@ def _scope_path(scope):
 def _stable_id(scope_path, index):
     token = f"{scope_path}:{index}".encode("utf-8")
     return hashlib.blake2s(token, digest_size=6).hexdigest()
+
+
+def _scope_full_path(scope):
+    """Return a human-readable scope path for display."""
+
+    parts = []
+    while scope is not None:
+        parts.append(scope.name)
+        scope = scope.parent
+    return " > ".join(reversed(parts))
 
 
 class Lifetime:
@@ -95,6 +128,12 @@ class Borrow:
         return f"{self.kind}→{self.target.id}@{self.borrower_scope.name}"
 
 
+def _arity_type_name(arity):
+    """Return the canonical Totem type name for a constructor of a given arity."""
+
+    return f"ADT<{arity}>"
+
+
 class Node:
     def __init__(self, op, typ, scope):
         scope_path = _scope_path(scope)
@@ -108,9 +147,24 @@ class Node:
         self.owned_life = Lifetime(scope, life_id)
         self.borrows = []
         self.grade = OPS.get(op, {}).get("grade", "pure")
+        self.meta = {}
+        self.arity = 0
+        self.update_type()
 
     def __repr__(self):
         return f"<{self.op}:{self.typ}@{self.scope.name}>"
+
+    def update_type(self):
+        """Refresh this node's inferred type based on current metadata and borrows."""
+
+        self.arity = len(self.borrows)
+        if "fixed_type" in self.meta:
+            self.typ = self.meta["fixed_type"]
+        elif self.op == "P":
+            self.typ = "match"
+        else:
+            self.typ = _arity_type_name(self.arity)
+        return self.typ
 
 
 class IRNode:
@@ -125,13 +179,15 @@ class IRNode:
 
 
 class Scope:
-    def __init__(self, name, parent=None):
+    def __init__(self, name, parent=None, *, effect_cap=None, fence=None):
         self.name = name
         self.parent = parent
         self.nodes = []
         self.children = []
         self.lifetimes = []
         self.drops = []
+        self.effect_cap = effect_cap
+        self.fence = fence
         if parent:
             parent.children.append(self)
 
@@ -156,7 +212,7 @@ class Effect:
 class TIRInstruction:
     """Single SSA-like instruction."""
 
-    def __init__(self, id, op, typ, grade, args, scope_path, produces=None):
+    def __init__(self, id, op, typ, grade, args, scope_path, produces=None metadata=None):    
         self.id = id
         self.op = op
         self.typ = typ
@@ -187,6 +243,8 @@ class TIRProgram:
     def __init__(self):
         self.instructions = []
         self.next_id = 0
+        self.constructor_tags = {}
+        self.next_tag = 0
 
     def new_id(self):
         vid = f"v{self.next_id}"
@@ -195,9 +253,55 @@ class TIRProgram:
 
     def emit(self, op, typ, grade, args, scope_path, produces=None):
         vid = self.new_id()
-        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces)
+        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces, metadata)
         self.instructions.append(instr)
         return vid
+
+    def constructor_tag(self, op, arity):
+        key = (op, arity)
+        if key not in self.constructor_tags:
+            self.constructor_tags[key] = self.next_tag
+            self.next_tag += 1
+        return self.constructor_tags[key]
+
+    def desugar_pattern_matches(self):
+        """Lower MATCH instructions into SWITCHes on constructor tags."""
+
+        lowered = []
+        for instr in self.instructions:
+            if instr.op != "MATCH":
+                lowered.append(instr)
+                continue
+
+            cases = instr.metadata.get("cases", [])
+            default = instr.metadata.get("default")
+            switch_meta = {
+                "cases": [
+                    {
+                        "tag": case.get("tag"),
+                        "result": case.get("result"),
+                        "constructor": case.get("constructor"),
+                    }
+                    for case in cases
+                ]
+            }
+            if default is not None:
+                switch_meta["default"] = default
+
+            lowered.append(
+                TIRInstruction(
+                    instr.id,
+                    "SWITCH",
+                    instr.typ,
+                    instr.grade,
+                    instr.args,
+                    instr.scope_path,
+                    switch_meta,
+                )
+            )
+
+        self.instructions = lowered
+        return self
 
     def __repr__(self):
         return "\n".join(map(str, self.instructions))
@@ -343,6 +447,137 @@ def emit_llvm_ir(tir):
         lines.append(f"declare i32 {callee}(...)")
 
     return "\n".join(lines).rstrip()
+class BytecodeInstruction:
+    """Executable instruction in the bytecode VM."""
+
+    __slots__ = ("origin_id", "op", "grade", "args", "produces")
+
+    def __init__(self, origin_id, op, grade, args=None, produces=None):
+        self.origin_id = origin_id
+        self.op = op
+        self.grade = grade
+        self.args = args or []
+        self.produces = produces
+
+
+class BytecodeProgram:
+    """Linear bytecode representation assembled from TIR."""
+
+    def __init__(self, instructions=None):
+        self.instructions = instructions or []
+
+    def append(self, instruction):
+        self.instructions.append(instruction)
+
+
+class BytecodeResult:
+    """Execution artefact from the bytecode VM."""
+
+    def __init__(self, grade, log, stack, env):
+        self.grade = grade
+        self.log = log
+        self.stack = stack
+        self.env = env
+
+
+class BytecodeVM:
+    """A minimal stack-based interpreter for Totem TIR."""
+
+    def __init__(self):
+        self.stack = []
+        self.env = {}
+        self.log = []
+        self._effect_index = 0
+
+    def execute(self, program):
+        for instr in program.instructions:
+            self._step(instr)
+
+        final_grade = EFFECT_GRADES[self._effect_index]
+        return BytecodeResult(final_grade, list(self.log), list(self.stack), dict(self.env))
+
+    # -- internal helpers -------------------------------------------------
+
+    def _step(self, instr):
+        grade_index = self._grade_index(instr.grade)
+        self._effect_index = max(self._effect_index, grade_index)
+
+        value, log_entries = self._apply_operation(instr)
+
+        self.stack.append(value)
+        self.env[instr.origin_id] = value
+        if instr.produces:
+            self.env[instr.produces] = value
+
+        if log_entries:
+            if isinstance(log_entries, (list, tuple)):
+                self.log.extend(log_entries)
+            else:
+                self.log.append(log_entries)
+
+    def _grade_index(self, grade):
+        try:
+            return EFFECT_GRADES.index(grade)
+        except ValueError:
+            return 0
+
+    def _apply_operation(self, instr):
+        op = instr.op
+
+        if op == "A":
+            value = 1
+            return value, [f"A:{value}"]
+        if op == "B":
+            self.env["counter"] = self.env.get("counter", 0) + 1
+            value = self.env["counter"]
+            return value, [f"B:inc->{value}"]
+        if op == "C":
+            value = "input_data"
+            return value, [f"C:read->{value}"]
+        if op == "D":
+            value = 2
+            return value, [f"D:{value}"]
+        if op == "E":
+            base = 0
+            if instr.args:
+                target = instr.args[0][1]
+                base = self.env.get(target, 0)
+            value = base + 3
+            return value, [f"E:{value}"]
+        if op == "F":
+            value = 5
+            return value, [f"F:{value}"]
+        if op == "G":
+            target = instr.args[0][1] if instr.args else None
+            borrowed = self.env.get(target, "?")
+            value = True
+            return value, [f"G:write({borrowed})"]
+
+        # Fallback: produce zero value with a log entry for traceability.
+        value = 0
+        return value, [f"{op}:{value}"]
+
+
+def assemble_bytecode(tir):
+    """Linearise a TIR program into bytecode instructions."""
+
+    program = BytecodeProgram()
+    for instr in tir.instructions:
+        args = []
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                args.append((arg.get("kind"), arg.get("target")))
+            else:
+                args.append((None, arg))
+        program.append(BytecodeInstruction(instr.id, instr.op, instr.grade, args, instr.produces))
+    return program
+
+
+def run_bytecode(program):
+    """Execute a BytecodeProgram and return the resulting effect/log/stack."""
+
+    vm = BytecodeVM()
+    return vm.execute(program)
 
 
 class MetaObject:
@@ -375,22 +610,66 @@ class MetaObject:
 
 def structural_decompress(src):
     """Build scope tree and typed node graph from raw characters."""
+
+    def combine_caps(parent_cap, new_cap):
+        if parent_cap is None:
+            return new_cap
+        if new_cap is None:
+            return parent_cap
+        parent_idx = EFFECT_GRADES.index(parent_cap)
+        new_idx = EFFECT_GRADES.index(new_cap)
+        return EFFECT_GRADES[min(parent_idx, new_idx)]
+
     root = Scope("root")
-    current = root
+    stack = [(root, None, None)]  # (scope, expected_closer, opener)
     last_node = None
 
+    openers = {
+        "{": {"close": "}", "limit": None, "prefix": "scope", "label": "{}"},
+        "(": {"close": ")", "limit": "pure", "prefix": "pure", "label": "()"},
+        "[": {"close": "]", "limit": "state", "prefix": "state", "label": "[]"},
+        "<": {"close": ">", "limit": "io", "prefix": "io", "label": "<>"},
+    }
+
+    closers = {info["close"]: opener for opener, info in openers.items()}
+
     for ch in src:
-        if ch == "{":
-            s = Scope(f"scope_{len(current.children)}", current)
-            current = s
-        elif ch == "}":
-            for n in current.nodes:
-                n.owned_life.end_scope = current
-                current.lifetimes.append(n.owned_life)
-                current.drops.append(n.owned_life)
-            current = current.parent or current
+        current = stack[-1][0]
+
+        if ch in openers:
+            info = openers[ch]
+            inherited_cap = combine_caps(current.effect_cap, info["limit"])
+            name = f"{info['prefix']}_{len(current.children)}"
+            s = Scope(
+                name,
+                current,
+                effect_cap=inherited_cap,
+                fence=info["label"],
+            )
+            stack.append((s, info["close"], ch))
+        elif ch in closers:
+            if len(stack) == 1:
+                raise ValueError(f"Unmatched closing fence '{ch}'")
+            scope, expected, opener = stack.pop()
+            if ch != expected:
+                raise ValueError(
+                    f"Mismatched fence: opened with '{opener}' but closed with '{ch}'"
+                )
+            for n in scope.nodes:
+                n.owned_life.end_scope = scope
+                scope.lifetimes.append(n.owned_life)
+                scope.drops.append(n.owned_life)
         elif ch.isalpha():
             node = Node(op=ch.upper(), typ="int32", scope=current)
+            cap = current.effect_cap
+            if cap is not None:
+                node_idx = EFFECT_GRADES.index(node.grade)
+                cap_idx = EFFECT_GRADES.index(cap)
+                if node_idx > cap_idx:
+                    fence = current.fence or "scope"
+                    raise ValueError(
+                        f"Effect grade '{node.grade}' exceeds '{cap}' fence in {fence}"
+                    )
             current.nodes.append(node)
 
             if last_node and last_node.scope == current:
@@ -398,7 +677,12 @@ def structural_decompress(src):
                 b = Borrow(kind, last_node.owned_life, current)
                 node.borrows.append(b)
                 last_node.owned_life.borrows.append(b)
+            node.update_type()
             last_node = node
+
+    if len(stack) != 1:
+        _, expected, opener = stack[-1]
+        raise ValueError(f"Unclosed fence '{opener}' expected '{expected}'")
 
     return root
 
@@ -434,10 +718,182 @@ def _scope_depth(scope):
     return d
 
 
+def compute_scope_grades(scope, grades=None):
+    """Populate a mapping of Scope → grade index."""
+
+    if grades is None:
+        grades = {}
+
+    idx = 0
+    for node in scope.nodes:
+        idx = max(idx, EFFECT_GRADES.index(node.grade))
+    for child in scope.children:
+        child_idx = compute_scope_grades(child, grades)
+        idx = max(idx, child_idx)
+
+    grades[scope] = idx
+    return idx
+
+
+def _collect_grade_cut(scope, target_idx, grades):
+    """Return nodes responsible for lifting this scope to the target grade."""
+
+    contributors = []
+
+    for node in scope.nodes:
+        node_idx = EFFECT_GRADES.index(node.grade)
+        if node_idx >= target_idx:
+            contributors.append(node)
+
+    for child in scope.children:
+        if grades.get(child, -1) >= target_idx:
+            contributors.extend(_collect_grade_cut(child, target_idx, grades))
+
+    return contributors
+
+
+def explain_grade(root_scope, target_grade):
+    """Compute nodes that raise the program to ``target_grade``."""
+
+    grade = target_grade.lower()
+    if grade not in EFFECT_GRADES:
+        raise ValueError(f"Unknown grade '{target_grade}'. Choose from {EFFECT_GRADES}.")
+
+    target_idx = EFFECT_GRADES.index(grade)
+    grades = {}
+    compute_scope_grades(root_scope, grades)
+    root_idx = grades.get(root_scope, 0)
+
+    if root_idx < target_idx:
+        return {
+            "achieved": False,
+            "final_grade": EFFECT_GRADES[root_idx],
+            "nodes": [],
+        }
+
+    contributors = _collect_grade_cut(root_scope, target_idx, grades)
+    seen = set()
+    unique_nodes = []
+    for node in contributors:
+        if node.id in seen:
+            continue
+        seen.add(node.id)
+        unique_nodes.append(node)
+
+    unique_nodes.sort(key=lambda n: (_scope_path(n.scope), n.id))
+
+    return {
+        "achieved": True,
+        "final_grade": EFFECT_GRADES[root_idx],
+        "nodes": unique_nodes,
+    }
+
+
+def _index_lifetimes(root_scope):
+    """Return lookup tables for lifetimes, nodes, and borrow origins."""
+
+    lifetime_by_id = {}
+    owner_node = {}
+    borrow_owners = {}
+
+    for scope in iter_scopes(root_scope):
+        for node in scope.nodes:
+            life = node.owned_life
+            lifetime_by_id[life.id] = life
+            owner_node[life.id] = node
+            for borrow in node.borrows:
+                borrow_owners[borrow] = node
+
+    node_by_id = {node.id: node for node in owner_node.values()}
+
+    return lifetime_by_id, owner_node, node_by_id, borrow_owners
+
+
+def explain_borrow(root_scope, identifier):
+    """Return a nested description of a borrow chain for ``identifier``."""
+
+    lifetime_by_id, owner_node, node_by_id, borrow_owners = _index_lifetimes(
+        root_scope
+    )
+
+    target_life = None
+
+    if identifier in lifetime_by_id:
+        target_life = lifetime_by_id[identifier]
+    elif identifier in node_by_id:
+        target_life = node_by_id[identifier].owned_life
+    else:
+        return {
+            "found": False,
+            "identifier": identifier,
+            "lines": [],
+        }
+
+    def describe_lifetime(life, indent=0, seen=None):
+        if seen is None:
+            seen = set()
+        prefix = "  " * indent
+        lines = []
+
+        scope_line = _scope_full_path(life.owner_scope)
+        end_line = (
+            _scope_full_path(life.end_scope)
+            if life.end_scope is not None
+            else "?"
+        )
+        owner = owner_node.get(life.id)
+        owner_label = (
+            f"node {owner.op} ({owner.id})"
+            if owner is not None
+            else "<unknown node>"
+        )
+        lines.append(
+            f"{prefix}Lifetime {life.id} owned by {owner_label} in {scope_line}, ends at {end_line}"
+        )
+
+        if life.id in seen:
+            lines.append(f"{prefix}  ↺ cycle detected, stopping traversal")
+            return lines
+
+        seen.add(life.id)
+
+        if life.borrows:
+            lines.append(f"{prefix}  Borrows:")
+        for borrow in life.borrows:
+            borrower = borrow_owners.get(borrow)
+            borrower_label = (
+                f"node {borrower.op} ({borrower.id})"
+                if borrower is not None
+                else "<unknown node>"
+            )
+            borrower_scope = _scope_full_path(borrow.borrower_scope)
+            outlives = ""
+            if life.end_scope is not None and _scope_depth(borrow.borrower_scope) > _scope_depth(
+                life.end_scope
+            ):
+                outlives = " (⚠ outlives owner scope)"
+
+            lines.append(
+                f"{prefix}    - {borrow.kind} borrow by {borrower_label} at {borrower_scope}{outlives}"
+            )
+            if borrower is not None:
+                lines.extend(describe_lifetime(borrower.owned_life, indent + 3, seen))
+
+        seen.remove(life.id)
+        return lines
+
+    lines = describe_lifetime(target_life)
+    return {
+        "found": True,
+        "identifier": identifier,
+        "lines": lines,
+    }
+
+
 def visualize_graph(root):
     """Render the decompressed scope graph with color-coded purity and lifetime->borrow edges."""
-    import networkx as nx
-    import matplotlib.pyplot as plt
+    if nx is None or plt is None:
+        raise RuntimeError("Visualization requires networkx and matplotlib to be installed")
 
     G = nx.DiGraph()
     lifetime_nodes_added = set()
@@ -496,6 +952,9 @@ def iter_scopes(scope):
 def export_graphviz(root, output_path):
     """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
     import pydot
+
+    if pydot is None:
+        raise RuntimeError("Graphviz export requires the optional pydot dependency")
 
     graph = pydot.Dot(
         "totem_scopes",
@@ -671,6 +1130,8 @@ def scope_to_dict(scope):
     """Recursively convert a Scope tree to a serializable dict."""
     return {
         "name": scope.name,
+        "effect_cap": scope.effect_cap,
+        "fence": scope.fence,
         "lifetimes": [
             {
                 "id": l.id,
@@ -692,8 +1153,10 @@ def scope_to_dict(scope):
                 "id": n.id,
                 "op": n.op,
                 "type": n.typ,
+                "arity": n.arity,
                 "grade": n.grade,
                 "lifetime_id": n.owned_life.id,
+                "meta": n.meta,
                 "borrows": [
                     {
                         "kind": b.kind,
@@ -748,7 +1211,12 @@ def load_totem_bitcode(filename):
 
 def reconstruct_scope(scope_dict, parent=None):
     """Rebuild a full Scope tree (with lifetimes and borrows) from a dictionary."""
-    scope = Scope(scope_dict["name"], parent)
+    scope = Scope(
+        scope_dict["name"],
+        parent,
+        effect_cap=scope_dict.get("effect_cap"),
+        fence=scope_dict.get("fence"),
+    )
 
     # First, create all nodes and lifetimes
     life_map = {}
@@ -756,6 +1224,8 @@ def reconstruct_scope(scope_dict, parent=None):
         node = Node(ninfo["op"], ninfo["type"], scope)
         node.grade = ninfo["grade"]
         node.owned_life.id = ninfo["lifetime_id"]
+        node.meta = ninfo.get("meta", {}) or {}
+        node.arity = ninfo.get("arity", 0)
         life_map[node.owned_life.id] = node.owned_life
         scope.nodes.append(node)
 
@@ -774,6 +1244,7 @@ def reconstruct_scope(scope_dict, parent=None):
                 b = Borrow(binfo["kind"], target_life, scope)
                 node.borrows.append(b)
                 target_life.borrows.append(b)
+        node.update_type()
 
     # Drops
     for did in scope_dict.get("drops", []):
@@ -914,9 +1385,10 @@ def show_logbook(limit=10):
 
 def ensure_keypair():
     """Create an RSA keypair if it doesn't exist."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    if rsa is None or serialization is None or default_backend is None:
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     try:
         with open(KEY_FILE, "rb") as f:
@@ -948,8 +1420,10 @@ def ensure_keypair():
 
 def sign_hash(sha256_hex):
     """Sign a SHA256 hex digest with the private key."""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
+    if hashes is None or padding is None:
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     private_key = ensure_keypair()
     signature = private_key.sign(
@@ -964,10 +1438,16 @@ def sign_hash(sha256_hex):
 
 def verify_signature(sha256_hex, signature_hex):
     """Verify a signature against the public key."""
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import padding
+    if (
+        InvalidSignature is None
+        or hashes is None
+        or serialization is None
+        or default_backend is None
+        or padding is None
+    ):
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     with open(PUB_FILE, "rb") as f:
         public_key = serialization.load_pem_public_key(
@@ -994,7 +1474,7 @@ def build_tir(scope, program=None, prefix="root"):
 
     scope_path = prefix if prefix == "root" else f"{prefix}.{scope.name}"
 
-    for node in scope.nodes:
+    for node in scope.nodes:        
         args = [
             {
                 "kind": "consume" if b.kind == "mut" else "borrow",
@@ -1002,17 +1482,42 @@ def build_tir(scope, program=None, prefix="root"):
             }
             for b in node.borrows
         ]
-        program.emit(
-            node.op,
-            node.typ,
-            node.grade,
-            args,
-            scope_path,
-            produces=node.owned_life.id,
-        )
+        # Pattern match nodes are first emitted as MATCH before being desugared.
+        if node.op == "P" and "match_cases" in node.meta:
+            cases_meta = []
+            for ctor in node.meta["match_cases"]:
+                if isinstance(ctor, dict):
+                    ctor_key = tuple(ctor.get("constructor", (ctor.get("op"), ctor.get("arity", 0))))
+                    result = ctor.get("result")
+                else:
+                    ctor_key, result = ctor
+                op_name, arity = ctor_key
+                tag = program.constructor_tag(op_name, arity)
+                cases_meta.append(
+                    {
+                        "constructor": (op_name, arity),
+                        "tag": tag,
+                        "result": result,
+                    }
+                )
+
+            metadata = {"cases": cases_meta}
+            if "default_case" in node.meta:
+                metadata["default"] = node.meta["default_case"]
+
+            program.emit("MATCH", node.typ, node.grade, args, scope_path, metadata)
+            continue
+
+        arity = len(args)
+        constructor_tag = program.constructor_tag(node.op, arity)
+        metadata = {"constructor_tag": constructor_tag, "arity": arity}
+        program.emit(node.op, node.typ, node.grade, args, scope_path, metadata, produces=node.owned_life.id)
 
     for child in scope.children:
         build_tir(child, program, scope_path)
+
+    if prefix == "root":
+        program.desugar_pattern_matches()
 
     return program
 
@@ -1086,6 +1591,7 @@ def fold_constants(tir):
                 "pure",
                 [],
                 instr.scope_path,
+                metadata=instr.metadata,
                 produces=instr.produces,
             )
             folded.value = val
@@ -1205,9 +1711,7 @@ def reorder_pure_ops(tir):
                 heapq.heappush(
                     heap,
                     (
-                        grade_rank.get(
-                            succ_instr.grade, len(EFFECT_GRADES)
-                        ),
+                        grade_rank.get(succ_instr.grade, len(EFFECT_GRADES)),
                         original_index[succ],
                         succ,
                     ),
@@ -1323,7 +1827,9 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):
             if cmd in (":quit", ":exit"):
                 break
             if cmd == ":help":
-                print("Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m")
+                print(
+                    "Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m"
+                )
                 print(f"History: last {history_limit} programs cached.")
                 continue
             if cmd == ":viz":
@@ -1436,6 +1942,16 @@ def parse_args(args):
         metavar="OUTPUT",
         help="Export a Graphviz scope visualization to an SVG file",
     )
+    argp.add_argument(
+        "--why-grade",
+        metavar="GRADE",
+        help="Explain which nodes raised the program to a given effect grade",
+    )
+    argp.add_argument(
+        "--why-borrow",
+        metavar="ID",
+        help="Explain the borrow chain for a lifetime or node identifier",
+    )
 
     return argp.parse_args(args)
 
@@ -1479,6 +1995,43 @@ def main(args):
     print("  → execution log:")
     for entry in result.log:
         print("   ", entry)
+
+    if params.why_grade:
+        print(f"\nWhy grade '{params.why_grade}':")
+        try:
+            info = explain_grade(tree, params.why_grade)
+        except ValueError as exc:
+            print(f"  ✗ {exc}")
+        else:
+            if not info["achieved"]:
+                print(
+                    "  "
+                    + "Grade not reached. Final grade: "
+                    + info["final_grade"]
+                )
+            elif not info["nodes"]:
+                print("  No nodes with that grade were found.")
+            else:
+                print("  Minimal cut responsible for the requested grade:")
+                for node in info["nodes"]:
+                    scope_path = _scope_full_path(node.scope)
+                    print(
+                        f"    • {node.op} [{node.grade}] id={node.id} @ {scope_path}"
+                    )
+                    if node.borrows:
+                        borrow_desc = ", ".join(
+                            f"{b.kind}->{b.target.id}" for b in node.borrows
+                        )
+                        print(f"        borrows: {borrow_desc}")
+
+    if params.why_borrow:
+        print(f"\nBorrow analysis for '{params.why_borrow}':")
+        info = explain_borrow(tree, params.why_borrow)
+        if not info["found"]:
+            print("  ✗ Identifier not found in this program.")
+        else:
+            for line in info["lines"]:
+                print("  " + line)
 
     export_totem_bitcode(tree, result, "program.totem.json")
     record_run("program.totem.json", result)
