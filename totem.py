@@ -1070,9 +1070,7 @@ def reorder_pure_ops(tir):
                 heapq.heappush(
                     heap,
                     (
-                        grade_rank.get(
-                            succ_instr.grade, len(EFFECT_GRADES)
-                        ),
+                        grade_rank.get(succ_instr.grade, len(EFFECT_GRADES)),
                         original_index[succ],
                         succ,
                     ),
@@ -1188,7 +1186,9 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):
             if cmd in (":quit", ":exit"):
                 break
             if cmd == ":help":
-                print("Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m")
+                print(
+                    "Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m"
+                )
                 print(f"History: last {history_limit} programs cached.")
                 continue
             if cmd == ":viz":
