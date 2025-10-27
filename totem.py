@@ -29,10 +29,13 @@ import argparse
 from datetime import datetime
 import hashlib
 import json
+from pathlib import Path
 import sys
 import uuid
-import networkx as nx
+
 import matplotlib.pyplot as plt
+import networkx as nx
+import pydot
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -40,6 +43,14 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
+
+GRADE_COLORS = {
+    "pure": "#8BC34A",
+    "state": "#FFEB3B",
+    "io": "#FF7043",
+    "sys": "#9575CD",
+    "meta": "#B0BEC5",
+}
 
 OPS = {
     "A": {"grade": "pure"},
@@ -274,13 +285,7 @@ def visualize_graph(root):
 
     def walk(scope):
         for n in scope.nodes:
-            color = {
-                "pure": "green",
-                "state": "yellow",
-                "io": "red",
-                "sys": "purple",
-                "meta": "gray",
-            }.get(getattr(n, "grade", "pure"), "gray")
+            color = GRADE_COLORS.get(getattr(n, "grade", "pure"), "#B0BEC5")
 
             G.add_node(n.id, label=f"{n.op}\n[{n.grade}]", color=color)
 
@@ -312,6 +317,95 @@ def visualize_graph(root):
 
     plt.title("Totem Program Graph — purity & lifetimes")
     plt.show()
+
+
+def iter_scopes(scope):
+    """Yield a scope and all descendants in depth-first order."""
+    yield scope
+    for child in scope.children:
+        yield from iter_scopes(child)
+
+
+def export_graphviz(root, output_path):
+    """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
+
+    graph = pydot.Dot(
+        "totem_scopes",
+        graph_type="digraph",
+        rankdir="LR",
+        splines="spline",
+        fontname="Helvetica",
+    )
+
+    lifetime_nodes = {}
+
+    def build_cluster(scope, path):
+        cluster_name = f"cluster_{path.replace('.', '_')}"
+        cluster = pydot.Cluster(
+            cluster_name,
+            label=path,
+            color="#7f8c8d",
+            fontname="Helvetica",
+            fontsize="10",
+            style="rounded",
+        )
+
+        for node in scope.nodes:
+            color = GRADE_COLORS.get(node.grade, "#B0BEC5")
+            node_label = f"{node.op}\\n[{node.grade}]"
+            graph_node = pydot.Node(
+                node.id,
+                label=node_label,
+                shape="box",
+                style="filled",
+                fillcolor=color,
+                color="#34495e",
+                fontname="Helvetica",
+            )
+            cluster.add_node(graph_node)
+
+            life = node.owned_life
+            lid = f"life_{life.id}"
+            if lid not in lifetime_nodes:
+                lifetime_nodes[lid] = pydot.Node(
+                    lid,
+                    label=f"L {life.id}",
+                    shape="ellipse",
+                    style="dashed",
+                    color="#7f8c8d",
+                    fontname="Helvetica",
+                )
+            cluster.add_node(lifetime_nodes[lid])
+
+        for child in scope.children:
+            child_path = f"{path}.{child.name}"
+            cluster.add_subgraph(build_cluster(child, child_path))
+
+        return cluster
+
+    graph.add_subgraph(build_cluster(root, "root"))
+
+    for scope in iter_scopes(root):
+        for node in scope.nodes:
+            for borrow in node.borrows:
+                src = f"life_{borrow.target.id}"
+                graph.add_edge(
+                    pydot.Edge(
+                        src,
+                        node.id,
+                        style="dashed",
+                        color="#7f8c8d",
+                        penwidth="1.2",
+                        arrowsize="0.8",
+                    )
+                )
+
+    output_path = Path(output_path)
+    if output_path.parent and not output_path.parent.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    graph.write_svg(str(output_path))
+    print(f"  ✓ Graphviz visualization exported → {output_path}")
 
 
 def print_scopes(scope, indent=0):
@@ -817,6 +911,11 @@ def parse_args(args):
     argp.add_argument("--src", help="Inline Totem source", default="{a{bc}de{fg}}")
     argp.add_argument("--verify", help="Verify signature for a logbook entry hash")
     argp.add_argument("--visualize", action="store_true", help="Render program graph")
+    argp.add_argument(
+        "--viz",
+        metavar="OUTPUT",
+        help="Export a Graphviz scope visualization to an SVG file",
+    )
 
     return argp.parse_args(args)
 
@@ -869,6 +968,8 @@ def main(args):
     print("\nTIR:")
     print(tir)
 
+    if params.viz:
+        export_graphviz(tree, params.viz)
     if params.visualize:
         visualize_graph(tree)
 
