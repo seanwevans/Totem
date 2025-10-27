@@ -1462,13 +1462,17 @@ def visualize_graph(root, script="purity"):  # pragma: no cover
             ax.margins(0.2)
             return []
 
-        mpl_animation.FuncAnimation(
+        animation = mpl_animation.FuncAnimation(
             fig,
             draw_frame,
             frames=len(events),
             interval=1200,
             repeat=True,
         )
+        # Keep a reference to the animation alive until ``plt.show`` returns. Without this,
+        # Matplotlib may garbage-collect the animation before it renders, producing a warning
+        # and preventing the animation from playing.
+        fig._totem_animation = animation
         plt.tight_layout()
         plt.show()
 
