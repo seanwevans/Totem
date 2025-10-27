@@ -33,14 +33,6 @@ import heapq
 import json
 from pathlib import Path
 import sys
-import networkx as nx
-import matplotlib.pyplot as plt
-import pydot
-
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.backends import default_backend
-from cryptography.exceptions import InvalidSignature
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
 
@@ -211,6 +203,148 @@ class TIRProgram:
         return "\n".join(map(str, self.instructions))
 
 
+def _mlir_type(typ):
+    """Map Totem types to MLIR types."""
+
+    mapping = {
+        "int32": "i32",
+        "int64": "i64",
+        "float": "f32",
+        "double": "f64",
+    }
+    return mapping.get(typ, "i32")
+
+
+def emit_mlir_module(tir):
+    """Lower a TIR program to a textual MLIR module."""
+
+    lattice = ", ".join(f'"{grade}"' for grade in EFFECT_GRADES)
+    lines = [
+        f"module attributes {{totem.effect_lattice = [{lattice}]}} {{",
+        "  func.func @main() -> () {",
+    ]
+
+    value_map = {}
+
+    for instr in tir.instructions:
+        result_name = instr.id
+        operands = []
+        operand_types = []
+        borrow_kinds = []
+
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                target = arg.get("target")
+                kind = arg.get("kind")
+            else:
+                target = arg
+                kind = None
+
+            if not target:
+                continue
+
+            operand = value_map.get(target, target)
+            operands.append(f"%{operand}")
+            operand_types.append(_mlir_type(instr.typ))
+            if kind:
+                borrow_kinds.append(f'"{kind}"')
+
+        operand_sig = ", ".join(operand_types)
+        if not operand_sig:
+            operand_sig = ""
+        else:
+            operand_sig = f"{operand_sig}"
+
+        attrs = [f'grade = "{instr.grade}"']
+        if borrow_kinds:
+            attrs.append(f"borrow_kinds = [{', '.join(borrow_kinds)}]")
+
+        attr_str = " " + "{" + ", ".join(attrs) + "}" if attrs else ""
+
+        operand_list = ", ".join(operands)
+        line = (
+            f"    %{result_name} = \"totem.{instr.op.lower()}\"({operand_list}) : "
+            f"({operand_sig}) -> {_mlir_type(instr.typ)}{attr_str}"
+        )
+        lines.append(line.rstrip())
+
+        value_map[instr.id] = result_name
+        if instr.produces:
+            value_map[instr.produces] = result_name
+
+    lines.append("    func.return")
+    lines.append("  }")
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+PURE_CONSTANTS = {
+    "A": 1,
+    "D": 2,
+    "F": 5,
+}
+
+
+def emit_llvm_ir(tir):
+    """Emit a simple LLVM IR view for the pure portion of a TIR program."""
+
+    pure_instrs = [instr for instr in tir.instructions if instr.grade == "pure"]
+    if not pure_instrs:
+        return "; Totem program has no pure segment to lower"
+
+    lines = [
+        "; Totem pure segment lowered to LLVM IR",
+        "define void @totem_main() {",
+        "entry:",
+    ]
+
+    value_map = {}
+    declared = set()
+
+    def map_operand(target):
+        return f"%{value_map.get(target, target)}"
+
+    for instr in pure_instrs:
+        result_name = instr.id
+
+        if instr.op in PURE_CONSTANTS:
+            const_val = PURE_CONSTANTS[instr.op]
+            lines.append(f"  %{result_name} = add i32 0, {const_val}")
+        else:
+            operands = []
+            for arg in instr.args:
+                if isinstance(arg, dict):
+                    target = arg.get("target")
+                else:
+                    target = arg
+                if not target:
+                    continue
+                operands.append(map_operand(target))
+
+            operand_parts = [f"i32 {op}" for op in operands]
+            callee = f"@totem_{instr.op.lower()}"
+            declared.add(callee)
+            call_operands = ", ".join(operand_parts)
+            lines.append(
+                f"  %{result_name} = call i32 {callee}({call_operands})"
+                if call_operands
+                else f"  %{result_name} = call i32 {callee}()"
+            )
+
+        value_map[instr.id] = result_name
+        if instr.produces:
+            value_map[instr.produces] = result_name
+
+    lines.append("  ret void")
+    lines.append("}")
+
+    for callee in sorted(declared):
+        lines.append(f"declare i32 {callee}(...)")
+
+    return "\n".join(lines).rstrip()
+
+
 class MetaObject:
     """A serializable reflection of a Totem runtime object."""
 
@@ -361,6 +495,7 @@ def iter_scopes(scope):
 
 def export_graphviz(root, output_path):
     """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
+    import pydot
 
     graph = pydot.Dot(
         "totem_scopes",
@@ -1350,6 +1485,14 @@ def main(args):
     tir = build_tir(tree)
     print("\nTIR:")
     print(tir)
+
+    mlir_module = emit_mlir_module(tir)
+    print("\nMLIR dialect:")
+    print(mlir_module)
+
+    llvm_ir = emit_llvm_ir(tir)
+    print("\nLLVM IR (pure segment):")
+    print(llvm_ir)
 
     if params.viz:
         export_graphviz(tree, params.viz)
