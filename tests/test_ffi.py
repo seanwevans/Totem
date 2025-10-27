@@ -14,6 +14,7 @@ from totem import (  # noqa: E402
     parse_inline_ffi,
     register_ffi_declarations,
 )
+from totem.ffi import _normalize_ffi_declarations  # noqa: E402
 
 
 def test_parse_inline_ffi_schema():
@@ -107,6 +108,13 @@ def test_register_ffi_declarations_rejects_invalid_specs():
         register_ffi_declarations({"name": "OK", "grade": "pure"})
 
 
+def test_parse_inline_ffi_handles_empty_and_invalid_input():
+    assert parse_inline_ffi("") == []
+
+    with pytest.raises(ValueError):
+        parse_inline_ffi("not:a valid declaration")
+
+
 def test_ffi_declaration_from_dict_supports_alias_keys():
     decl = FFIDeclaration.from_dict(
         {
@@ -152,3 +160,8 @@ def test_normalize_ffi_handles_various_inputs():
     register_ffi_declarations(tuple_spec)
     registry = get_registered_ffi_declarations()
     assert "TV" in registry and registry["TV"].grade == "sys"
+
+
+def test_normalize_ffi_declarations_handles_nothing():
+    assert _normalize_ffi_declarations(None) == []
+    assert _normalize_ffi_declarations("   \n  ") == []
