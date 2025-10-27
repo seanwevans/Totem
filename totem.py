@@ -585,6 +585,7 @@ def _certificate_payload_digest(payload):
 def _collect_aliasing_payload(scope):
     lifetimes = []
     lifetime_counts = {}
+    node_lifetimes = []
     borrows = []
 
     for sc in iter_scopes(scope):
@@ -599,6 +600,13 @@ def _collect_aliasing_payload(scope):
             lifetime_counts[life.id] = lifetime_counts.get(life.id, 0) + 1
 
         for node in sc.nodes:
+            node_lifetimes.append(
+                {
+                    "node": node.id,
+                    "owned_lifetime": node.owned_life.id,
+                    "scope": scope_path,
+                }
+            )
             for borrow in node.borrows:
                 borrows.append(
                     {
@@ -609,6 +617,9 @@ def _collect_aliasing_payload(scope):
                 )
 
     lifetimes.sort(key=lambda x: (x["id"], x["owner"], x.get("end")))
+    node_lifetimes.sort(
+        key=lambda x: (x["node"], x["owned_lifetime"], x["scope"])
+    )
     borrows.sort(key=lambda x: (x["node"], x["kind"], x["target"]))
 
     duplicates = sorted([lid for lid, count in lifetime_counts.items() if count > 1])
@@ -620,6 +631,7 @@ def _collect_aliasing_payload(scope):
 
     payload = {
         "lifetimes": lifetimes,
+        "node_lifetimes": node_lifetimes,
         "borrows": borrows,
         "duplicate_lifetimes": duplicates,
         "dangling_borrows": dangling,
@@ -630,6 +642,7 @@ def _collect_aliasing_payload(scope):
 
     summary = {
         "lifetimes": len(lifetimes),
+        "node_lifetimes": len(node_lifetimes),
         "borrows": len(borrows),
         "duplicate_lifetimes": duplicates,
         "dangling_borrows": dangling,
