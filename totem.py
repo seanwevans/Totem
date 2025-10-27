@@ -81,6 +81,16 @@ def _stable_id(scope_path, index):
     return hashlib.blake2s(token, digest_size=6).hexdigest()
 
 
+def _scope_full_path(scope):
+    """Return a human-readable scope path for display."""
+
+    parts = []
+    while scope is not None:
+        parts.append(scope.name)
+        scope = scope.parent
+    return " > ".join(reversed(parts))
+
+
 class Lifetime:
     def __init__(self, owner_scope, identifier):
         self.id = identifier
@@ -298,6 +308,178 @@ def _scope_depth(scope):
         d += 1
         scope = scope.parent
     return d
+
+
+def compute_scope_grades(scope, grades=None):
+    """Populate a mapping of Scope → grade index."""
+
+    if grades is None:
+        grades = {}
+
+    idx = 0
+    for node in scope.nodes:
+        idx = max(idx, EFFECT_GRADES.index(node.grade))
+    for child in scope.children:
+        child_idx = compute_scope_grades(child, grades)
+        idx = max(idx, child_idx)
+
+    grades[scope] = idx
+    return idx
+
+
+def _collect_grade_cut(scope, target_idx, grades):
+    """Return nodes responsible for lifting this scope to the target grade."""
+
+    contributors = []
+
+    for node in scope.nodes:
+        node_idx = EFFECT_GRADES.index(node.grade)
+        if node_idx >= target_idx:
+            contributors.append(node)
+
+    for child in scope.children:
+        if grades.get(child, -1) >= target_idx:
+            contributors.extend(_collect_grade_cut(child, target_idx, grades))
+
+    return contributors
+
+
+def explain_grade(root_scope, target_grade):
+    """Compute nodes that raise the program to ``target_grade``."""
+
+    grade = target_grade.lower()
+    if grade not in EFFECT_GRADES:
+        raise ValueError(f"Unknown grade '{target_grade}'. Choose from {EFFECT_GRADES}.")
+
+    target_idx = EFFECT_GRADES.index(grade)
+    grades = {}
+    compute_scope_grades(root_scope, grades)
+    root_idx = grades.get(root_scope, 0)
+
+    if root_idx < target_idx:
+        return {
+            "achieved": False,
+            "final_grade": EFFECT_GRADES[root_idx],
+            "nodes": [],
+        }
+
+    contributors = _collect_grade_cut(root_scope, target_idx, grades)
+    seen = set()
+    unique_nodes = []
+    for node in contributors:
+        if node.id in seen:
+            continue
+        seen.add(node.id)
+        unique_nodes.append(node)
+
+    unique_nodes.sort(key=lambda n: (_scope_path(n.scope), n.id))
+
+    return {
+        "achieved": True,
+        "final_grade": EFFECT_GRADES[root_idx],
+        "nodes": unique_nodes,
+    }
+
+
+def _index_lifetimes(root_scope):
+    """Return lookup tables for lifetimes, nodes, and borrow origins."""
+
+    lifetime_by_id = {}
+    owner_node = {}
+    borrow_owners = {}
+
+    for scope in iter_scopes(root_scope):
+        for node in scope.nodes:
+            life = node.owned_life
+            lifetime_by_id[life.id] = life
+            owner_node[life.id] = node
+            for borrow in node.borrows:
+                borrow_owners[borrow] = node
+
+    node_by_id = {node.id: node for node in owner_node.values()}
+
+    return lifetime_by_id, owner_node, node_by_id, borrow_owners
+
+
+def explain_borrow(root_scope, identifier):
+    """Return a nested description of a borrow chain for ``identifier``."""
+
+    lifetime_by_id, owner_node, node_by_id, borrow_owners = _index_lifetimes(
+        root_scope
+    )
+
+    target_life = None
+
+    if identifier in lifetime_by_id:
+        target_life = lifetime_by_id[identifier]
+    elif identifier in node_by_id:
+        target_life = node_by_id[identifier].owned_life
+    else:
+        return {
+            "found": False,
+            "identifier": identifier,
+            "lines": [],
+        }
+
+    def describe_lifetime(life, indent=0, seen=None):
+        if seen is None:
+            seen = set()
+        prefix = "  " * indent
+        lines = []
+
+        scope_line = _scope_full_path(life.owner_scope)
+        end_line = (
+            _scope_full_path(life.end_scope)
+            if life.end_scope is not None
+            else "?"
+        )
+        owner = owner_node.get(life.id)
+        owner_label = (
+            f"node {owner.op} ({owner.id})"
+            if owner is not None
+            else "<unknown node>"
+        )
+        lines.append(
+            f"{prefix}Lifetime {life.id} owned by {owner_label} in {scope_line}, ends at {end_line}"
+        )
+
+        if life.id in seen:
+            lines.append(f"{prefix}  ↺ cycle detected, stopping traversal")
+            return lines
+
+        seen.add(life.id)
+
+        if life.borrows:
+            lines.append(f"{prefix}  Borrows:")
+        for borrow in life.borrows:
+            borrower = borrow_owners.get(borrow)
+            borrower_label = (
+                f"node {borrower.op} ({borrower.id})"
+                if borrower is not None
+                else "<unknown node>"
+            )
+            borrower_scope = _scope_full_path(borrow.borrower_scope)
+            outlives = ""
+            if life.end_scope is not None and _scope_depth(borrow.borrower_scope) > _scope_depth(
+                life.end_scope
+            ):
+                outlives = " (⚠ outlives owner scope)"
+
+            lines.append(
+                f"{prefix}    - {borrow.kind} borrow by {borrower_label} at {borrower_scope}{outlives}"
+            )
+            if borrower is not None:
+                lines.extend(describe_lifetime(borrower.owned_life, indent + 3, seen))
+
+        seen.remove(life.id)
+        return lines
+
+    lines = describe_lifetime(target_life)
+    return {
+        "found": True,
+        "identifier": identifier,
+        "lines": lines,
+    }
 
 
 def visualize_graph(root):
@@ -1301,6 +1483,16 @@ def parse_args(args):
         metavar="OUTPUT",
         help="Export a Graphviz scope visualization to an SVG file",
     )
+    argp.add_argument(
+        "--why-grade",
+        metavar="GRADE",
+        help="Explain which nodes raised the program to a given effect grade",
+    )
+    argp.add_argument(
+        "--why-borrow",
+        metavar="ID",
+        help="Explain the borrow chain for a lifetime or node identifier",
+    )
 
     return argp.parse_args(args)
 
@@ -1344,6 +1536,43 @@ def main(args):
     print("  → execution log:")
     for entry in result.log:
         print("   ", entry)
+
+    if params.why_grade:
+        print(f"\nWhy grade '{params.why_grade}':")
+        try:
+            info = explain_grade(tree, params.why_grade)
+        except ValueError as exc:
+            print(f"  ✗ {exc}")
+        else:
+            if not info["achieved"]:
+                print(
+                    "  "
+                    + "Grade not reached. Final grade: "
+                    + info["final_grade"]
+                )
+            elif not info["nodes"]:
+                print("  No nodes with that grade were found.")
+            else:
+                print("  Minimal cut responsible for the requested grade:")
+                for node in info["nodes"]:
+                    scope_path = _scope_full_path(node.scope)
+                    print(
+                        f"    • {node.op} [{node.grade}] id={node.id} @ {scope_path}"
+                    )
+                    if node.borrows:
+                        borrow_desc = ", ".join(
+                            f"{b.kind}->{b.target.id}" for b in node.borrows
+                        )
+                        print(f"        borrows: {borrow_desc}")
+
+    if params.why_borrow:
+        print(f"\nBorrow analysis for '{params.why_borrow}':")
+        info = explain_borrow(tree, params.why_borrow)
+        if not info["found"]:
+            print("  ✗ Identifier not found in this program.")
+        else:
+            for line in info["lines"]:
+                print("  " + line)
 
     export_totem_bitcode(tree, result, "program.totem.json")
     record_run("program.totem.json", result)
