@@ -63,6 +63,21 @@ def test_root_grade_matches_max_child(sample_root):
     assert result.grade == EFFECT_GRADES[expected_idx]
 
 
+def test_pure_fence_rejects_impure_ops():
+    with pytest.raises(ValueError):
+        structural_decompress("(c)")
+
+
+def test_state_fence_rejects_io_ops():
+    # 'b' (state) is allowed, but 'c' (io) is not.
+    structural_decompress("[ab]")
+    with pytest.raises(ValueError):
+        structural_decompress("[ac]")
+
+
+def test_nested_scope_inherits_parent_cap():
+    with pytest.raises(ValueError):
+        structural_decompress("(a{b})")
 def test_bytecode_vm_matches_scope_evaluation(sample_root):
     tir = build_tir(sample_root)
     bytecode = assemble_bytecode(tir)
