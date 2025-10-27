@@ -26,6 +26,7 @@ Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 """
 
 import argparse
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import difflib
@@ -584,6 +585,14 @@ class TIRProgram:
         )
         self.instructions.append(instr)
         return vid
+
+    def clone(self):
+        program = TIRProgram()
+        program.instructions = [deepcopy(instr) for instr in self.instructions]
+        program.next_id = self.next_id
+        program.constructor_tags = dict(self.constructor_tags)
+        program.next_tag = self.next_tag
+        return program
 
     def constructor_tag(self, op, arity):
         key = (op, arity)
@@ -1465,7 +1474,7 @@ def evaluate_node(node, env):
     # Meta-level operations (demo)
     if op == "M":  # reflect current scope into a mutable TIR session
         base_tir = build_tir(node.scope, include_attached=False)
-        session = TIRProgram()
+        session = base_tir.clone()
         meta_obj = MetaObject("TIR", session)
         return Effect("meta", meta_obj, [f"M:reflect({len(base_tir.instructions)})"])
     elif op == "N":  # compile attached meta scope into the borrowed TIR
