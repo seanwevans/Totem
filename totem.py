@@ -85,6 +85,23 @@ OPS = {
     "S": {"grade": "sys"},    
 }
 
+IO_IMPORTS = {
+    "C": {
+        "capability": "io.read",
+        "module": "totem_io",
+        "name": "io_read",
+        "params": [],
+        "results": ["i32"],
+    },
+    "G": {
+        "capability": "io.write",
+        "module": "totem_io",
+        "name": "io_write",
+        "params": ["i32"],
+        "results": [],
+    },
+}
+
 LOGBOOK_FILE = "totem.logbook.jsonl"
 KEY_FILE = "totem_private_key.pem"
 PUB_FILE = "totem_public_key.pem"
@@ -2134,6 +2151,191 @@ def build_tir(scope, program=None, prefix="root"):
     return program
 
 
+def _wasm_local_name(identifier):
+    return f"${identifier}"
+
+
+def _format_wasm_list(items, prefix=""):
+    return [f"{prefix}{item}" for item in items]
+
+
+def tir_to_wat(tir, capabilities=None):
+    """Compile a TIRProgram into a WebAssembly text module.
+
+    Only pure instructions are lowered to direct WebAssembly operations. IO-grade
+    instructions are exposed as host imports and require the caller to provide
+    the corresponding capability string (e.g. ``io.read``).
+    """
+
+    capabilities = set(capabilities or [])
+    required_capabilities = []
+
+    local_decls = []
+    local_set = set()
+    body_lines = []
+    last_pure_local = None
+    alias_map = {}
+
+    def declare_local(identifier):
+        lname = _wasm_local_name(identifier)
+        if lname not in local_set:
+            local_decls.append(f"(local {lname} i32)")
+            local_set.add(lname)
+        return lname
+
+    def bind_aliases(instr, local_name):
+        alias_map[instr.id] = local_name
+        if instr.produces:
+            alias_map[instr.produces] = local_name
+
+    imports_needed = {}
+
+    value_producers = {}
+    for instr in tir.instructions:
+        value_producers[instr.id] = instr
+        if instr.produces:
+            value_producers[instr.produces] = instr
+
+    for instr in tir.instructions:
+        if instr.grade == "pure":
+            local_name = declare_local(instr.id)
+            bind_aliases(instr, local_name)
+
+            if instr.op in {"A", "D", "F"}:
+                const_val = {"A": 1, "D": 2, "F": 5}[instr.op]
+                body_lines.append(f"(local.set {local_name} (i32.const {const_val}))")
+            elif instr.op == "CONST" and hasattr(instr, "value"):
+                body_lines.append(
+                    f"(local.set {local_name} (i32.const {int(instr.value)}))"
+                )
+            elif instr.op == "E":
+                if not instr.args:
+                    raise ValueError("E operation expects at least one borrow argument")
+                arg = instr.args[0]
+                target = arg.get("target") if isinstance(arg, dict) else arg
+                dep_local = alias_map.get(target)
+                if not dep_local:
+                    raise ValueError(f"Unknown borrow target {target} for op E")
+                body_lines.append(
+                    f"(local.set {local_name} (i32.add (local.get {dep_local}) (i32.const 3)))"
+                )
+            else:
+                raise NotImplementedError(
+                    f"Pure operation {instr.op} is not supported for WASM lowering"
+                )
+            last_pure_local = local_name
+        elif instr.grade == "io":
+            io_info = IO_IMPORTS.get(instr.op)
+            if not io_info:
+                raise NotImplementedError(
+                    f"IO operation {instr.op} missing import metadata"
+                )
+            cap = io_info["capability"]
+            if cap not in capabilities:
+                raise PermissionError(
+                    f"Capability '{cap}' required to lower IO operation {instr.op}"
+                )
+            required_capabilities.append(cap)
+            import_key = (io_info["module"], io_info["name"])
+            if import_key not in imports_needed:
+                imports_needed[import_key] = io_info
+
+            if instr.produces:
+                local_name = declare_local(instr.id)
+                bind_aliases(instr, local_name)
+            else:
+                local_name = None
+
+            call_operands = []
+            for arg in instr.args:
+                target = arg.get("target") if isinstance(arg, dict) else arg
+                dep_local = alias_map.get(target)
+                if dep_local:
+                    call_operands.append(f"(local.get {dep_local})")
+                else:
+                    producer = value_producers.get(target)
+                    if producer:
+                        raise ValueError(
+                            "IO operation "
+                            f"{instr.op} argument {target} depends on "
+                            f"{producer.op} [{producer.grade}], which cannot be lowered to WebAssembly"
+                        )
+                    elif isinstance(target, str):
+                        raise ValueError(
+                            f"IO operation {instr.op} has unknown dependency {target}"
+                        )
+                    else:
+                        raise ValueError(
+                            f"IO operation {instr.op} received unsupported operand {arg}"
+                        )
+
+            if call_operands:
+                call_expr = (
+                    f"(call ${io_info['name']} " + " ".join(call_operands) + ")"
+                )
+            else:
+                call_expr = f"(call ${io_info['name']})"
+
+            if io_info["results"]:
+                body_lines.append(f"(local.set {local_name} {call_expr})")
+            else:
+                body_lines.append(call_expr)
+                if local_name:
+                    body_lines.append(f"(local.set {local_name} (i32.const 0))")
+        else:
+            # Meta and stateful instructions are not lowered to WebAssembly.
+            continue
+
+    module_lines = ["(module"]
+
+    for (module, name), info in imports_needed.items():
+        params = " ".join(f"(param {p})" for p in info["params"])
+        results = " ".join(f"(result {r})" for r in info["results"])
+        signature = " ".join(filter(None, [params, results]))
+        module_lines.append(
+            f"  (import \"{module}\" \"{name}\" (func ${name} {signature}))"
+        )
+
+    module_lines.append("  (func $run (export \"run\") (result i32)")
+    module_lines.extend(_format_wasm_list(local_decls, prefix="    "))
+    module_lines.extend(_format_wasm_list(body_lines, prefix="    "))
+    if last_pure_local:
+        module_lines.append(f"    (return (local.get {last_pure_local}))")
+    else:
+        module_lines.append("    (return (i32.const 0))")
+    module_lines.append("  )")
+    module_lines.append(")")
+
+    metadata = {
+        "imports": sorted(set(required_capabilities)),
+        "locals": sorted(local_set),
+        "pure_instructions": len([i for i in tir.instructions if i.grade == "pure"]),
+        "io_instructions": len([i for i in tir.instructions if i.grade == "io"]),
+    }
+
+    return "\n".join(module_lines), metadata
+
+
+def export_wasm_module(tir, output_path, capabilities=None, metadata_path=None):
+    """Write a WebAssembly text module to disk."""
+
+    wat, metadata = tir_to_wat(tir, capabilities=capabilities)
+    output_path = Path(output_path)
+    if output_path.parent and not output_path.parent.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(wat, encoding="utf-8")
+    print(f"  ✓ WASM module exported → {output_path}")
+
+    if metadata_path:
+        meta_path = Path(metadata_path)
+        if meta_path.parent and not meta_path.parent.exists():
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        print(f"  ✓ WASM metadata exported → {meta_path}")
+
+    return metadata
+
+
 def reflect(obj):
     """
     Produce a MetaObject view of any Totem structure.
@@ -2566,6 +2768,20 @@ def parse_args(args):
         help="Export a Graphviz scope visualization to an SVG file",
     )
     argp.add_argument(
+        "--wasm",
+        metavar="OUTPUT",
+        help="Export the pure TIR as a WebAssembly text module",
+    )
+    argp.add_argument(
+        "--wasm-metadata",
+        metavar="OUTPUT",
+        help="Write lowering metadata alongside the WebAssembly module",
+    )
+    argp.add_argument(
+        "--capability",
+        action="append",
+        dest="capabilities",
+        help="Grant a capability (e.g. io.read) when lowering to WebAssembly",
         "--why-grade",
         metavar="GRADE",
         help="Explain which nodes raised the program to a given effect grade",
@@ -2662,6 +2878,18 @@ def main(args):
     print("\nTIR:")
     print(tir)
 
+    if params.wasm:
+        try:
+            export_wasm_module(
+                tir,
+                params.wasm,
+                capabilities=params.capabilities,
+                metadata_path=params.wasm_metadata,
+            )
+        except PermissionError as exc:
+            print(f"  ✗ {exc}")
+        except NotImplementedError as exc:
+            print(f"  ✗ {exc}")
     mlir_module = emit_mlir_module(tir)
     print("\nMLIR dialect:")
     print(mlir_module)

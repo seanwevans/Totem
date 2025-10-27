@@ -153,6 +153,50 @@ The graph displays:
 
 ---
 
+## ⚡ WebAssembly Backend
+
+Totem can lower the **pure portion of the TIR** into a WebAssembly module. All
+`IO`-graded nodes become **host imports guarded by explicit capabilities** so the
+runtime must opt-in to side effects.
+
+```bash
+$ ./totem.py \
+    --src "{a{bc}de{fg}}" \
+    --wasm web/program.wat \
+    --wasm-metadata web/program.wasm.json \
+    --capability io.read \
+    --capability io.write
+```
+
+- Pure instructions (`A`, `D`, `E`, `F`) are emitted as local computations.
+- IO instructions (`C`, `G`) become imports (`totem_io.io_read/io_write`).
+- Granting a capability is mandatory; missing permissions raise an error.
+
+The optional metadata file records which capabilities were imported, how many
+pure vs. IO instructions were seen, and the locals allocated in the generated
+module.
+
+### 🖥️ Browser Demo
+
+Serve the `web/` directory to see the WASM backend and lifetime viz together:
+
+```bash
+$ python totem.py --src "{a{bc}de{fg}}" \
+    --wasm web/program.wat \
+    --wasm-metadata web/program.wasm.json \
+    --capability io.read --capability io.write
+$ cp program.totem.json web/
+$ python -m http.server --directory web
+```
+
+Then open `http://localhost:8000/demo.html` to:
+
+1. Compile the emitted WAT to WASM in the browser using `wabt.js`.
+2. Run the exported `run()` function with capability-gated IO shims.
+3. Visualize the Totem scope graph via D3, reusing the serialized bitcode.
+
+---
+
 ## 🧱 Architecture Roadmap
 
 | Phase | Goal | Description |
