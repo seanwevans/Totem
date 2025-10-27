@@ -1,138 +1,168 @@
-# 🪶 Totem  
+# 🪶 Totem — A No-Syntax-Error Programming Language
 
-**Totem** is a total, decompressive, typed language.  
-Every UTF-8 string is a valid Totem program — there are no syntax errors, ever.
-
-Instead of parsing text, Totem **inflates** information.  
-The compiler acts as a **semantic decompressor**, mapping raw bytes into a fully typed, scope-aware, and lifetime-safe computation graph.
-
-Totem unifies **type theory**, **information theory**, and **systems safety** into a single algebraic model:
-
-```
-TOTEM := (Σ*, D, ⊗, T, E)
-
-where
-  Σ* = UTF-8 program space
-  D  = total decompressor → typed AST graph
-  ⊗  = monoidal composition operator
-  T  = type / lifetime / effect lattice
-  E  = total evaluator
-```
+> Every UTF-8 string is a valid Totem program. The compiler is the decompressor.
 
 ---
 
-## Why Totem?
+## 🌐 Overview
 
-| Principle | Meaning |
-|------------|----------|
-| **Totality** | Every UTF-8 input inflates into a well-typed program. No syntax errors, no undefined behavior. |
-| **Arity Algebra** | Function signatures and types emerge automatically from argument structure (arity). |
-| **Scoped Geometry** | `{}` and `()` build real lexical and evaluation scopes; ownership and lifetimes follow geometry. |
-| **Purity Gradient** | Effects are modeled as a graded monad (`pure ⊂ state ⊂ io ⊂ sys ⊂ meta`). |
-| **Safe by Construction** | Lifetimes and borrows are inferred automatically; aliasing and use-after-free are impossible. |
-| **Decompressive Compilation** | The compiler expands compressed meaning into structured, typed computation. |
-| **Continuous Semantics** | Similar bytes produce similar programs — enabling mutation, learning, and program synthesis. |
+**Totem** is a self-contained language and runtime built around a single principle:
+
+> *No syntax errors. Every string compiles.*
+
+Totem treats source text as a compressed representation of structure, effects, and computation.  
+The compiler acts as a *structural decompressor*, inferring lifetimes, purity, and control flow.
+
+### 🧩 Design Stack
+
+| Layer | Description | Status |
+|--------|-------------|--------|
+| **Structural Decompressor** | Every UTF-8 string → valid scoped AST | ✅ |
+| **Type & Lifetime Inference** | Rust-like ownership, drops, borrows | ✅ |
+| **Purity/Effect Lattice** | `Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta` | ✅ |
+| **Evaluator** | Graded effect monad runtime | ✅ |
+| **Visualization** | NetworkX graph of scopes & lifetimes | ✅ |
+| **Bitcode Serialization** | Portable `.totem.json` IR | ✅ |
+| **Reload & Re-Execution** | Deterministic round-trip | ✅ |
+| **Hash & Diff** | Semantic identity | ✅ |
+| **Logbook Ledger** | Provenance tracking | ✅ |
+| **Cryptographic Signatures** | Proof-of-origin | ✅ |
 
 ---
 
-## Example
+## ⚙️ Core Ideas
 
-```totem
+### 1. **No Syntax Errors**
+Every byte sequence is structurally valid. Braces define scopes; letters define operations.
+
+```bash
 {a{bc}de{fg}}
 ```
 
-Inflates to a nested scope graph:
+This expands into nested scopes with lifetimes, borrows, and drops — all inferred automatically.
+
+### 2. **Ownership & Borrowing**
+Totem automatically assigns lifetimes and enforces Rust-style aliasing rules:
+- Mutable (`mut`) and shared (`shared`) borrows are exclusive.
+- No borrow can outlive its parent lifetime.
+
+### 3. **Effect Lattice**
+Purity is compositional:
 
 ```
-Scope(root)
-  Scope(scope_0)
-    A:int32
-    Scope(scope_1)
-      B:int32  → shared borrow of A
-      C:int32  → mut borrow of B
-      drops [B, C]
-    D:int32  → shared borrow of A
-    E:int32  → mut borrow of D
-    Scope(scope_2)
-      F:int32  → shared borrow of E
-      G:int32  → mut borrow of F
-      drops [F, G]
-    drops [A, D, E]
+Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 ```
 
-Compile-time checks guarantee:
-- All borrows are valid.
-- No mutable + shared aliasing.
-- No borrow outlives its owner.
-- All values are dropped safely at end of scope.
+Each node propagates its grade through a *graded monad*, preserving effect isolation at runtime.
 
----
+### 4. **Typed Intermediate Representation (TIR)**
+Totem lowers decompressed scopes into a simple SSA-like IR:
 
-## Architecture
-
-```
-UTF-8 bytes
-    ↓
-[ Decompressor ]
-    → builds scopes `{}` `()`
-    → infers operator arity and types
-    ↓
-[ Type & Lifetime Graph ]
-    → computes ownership, borrows, drops
-    ↓
-[ Purity / Effect Analysis ]
-    → isolates impure nodes in effect scopes
-    ↓
-[ Evaluator / Backend ]
-    → executes total graph deterministically
+```plaintext
+v0 = A() : int32 [pure] @root.scope_0
+v1 = B() : int32 [state] @root.scope_0.scope_0
+v2 = C(v1) : int32 [io] @root.scope_0.scope_0
 ```
 
-Every stage is **total** — no parsing errors, no undefined states.
+This TIR serves as the canonical portable format — similar to LLVM bitcode, but fully serializable.
+
+### 5. **Provenance & Verification**
+Every compiled run is cryptographically signed and recorded in a ledger:
+
+```bash
+  📜 Recorded and signed run → totem.logbook.jsonl
+  SHA256(program.totem.json) = <digest>
+```
+
+This enables reproducible builds and verifiable provenance.
 
 ---
 
-## Philosophy
+## 🧮 Example Session
 
-> Programming is compression.  
-> Compilation is decompression.  
-> Safety is geometry.
+```bash
+$ ./totem.py --src "{a{bc}de{fg}}"
+Source: {a{bc}de{fg}}
+Compile-time analysis:
+  ✓ All lifetime and borrow checks passed
 
-Totem treats computation as **information un-folding**:  
-code is not written, it is *unpacked* from data.  
-Every byte belongs, every operation finds its lawful place in the algebra.
+Runtime evaluation:
+  → final grade: io
+  → execution log:
+    A:1
+    D:2
+    E:5
+    B:inc->1
+    C:read->input_data
+    F:5
+    G:write(5)
+  ✓ Totem Bitcode exported → program.totem.json
+  📜 Recorded and signed run → totem.logbook.jsonl
+```
 
----
+### Reload and Verify
 
-## Current Status
-
-- ✅ Structural decompressor → builds scopes and typed nodes  
-- ✅ Lifetime & borrow inference  
-- ✅ Compile-time safety analysis  
-- 🔜 Purity / effect monad layer  
-- 🔜 Typed IR and interpreter  
-- 🔜 Rust / MLIR backend  
-- 🔜 Visualizer for scopes, lifetimes, and effects
-
----
-
-## Roadmap
-
-1. **Purity-aware evaluation** — execute total graphs with effect isolation.  
-2. **Typed IR (TIR)** — a linear SSA form for Totem graphs.  
-3. **Backend targets** — generate Rust or LLVM IR.  
-4. **Visualizer** — inspect the decompressed program graph in real time.  
-5. **Continuous semantics** — experiment with evolutionary and neural programming over Totem space.  
-
----
-
-## License
-
-MIT (for now). Totem is an experiment in total languages and safe compilation.
+```bash
+$ ./totem.py --load program.totem.json
+$ ./totem.py --hash program.totem.json
+$ ./totem.py --logbook
+$ ./totem.py --diff program1.totem.json program2.totem.json
+```
 
 ---
 
-## Credits
+## 🔐 Provenance Chain
 
-**Totem** is an original research language concept by Sean Evans.  
-It blends ideas from Rust, type theory, category theory, and information geometry  
-to explore a world where *no program is ever invalid*.
+Totem automatically maintains an append-only **logbook ledger**, storing:
+
+- SHA256 hash of the bitcode  
+- RSA signature  
+- Execution metadata (grade, logs)  
+- Timestamped entries for reproducibility
+
+Keys are stored locally in:
+```
+totem_private_key.pem
+totem_public_key.pem
+```
+
+---
+
+## 🧭 Meta Layer
+
+Totem supports *self-reflective meta-operations* (`Meta` grade):
+
+| Operation | Description |
+|------------|-------------|
+| `reflect()` | Returns a `MetaObject` representation of a runtime structure |
+| `meta_emit()` | Dynamically extends the TIR at runtime |
+| `fold_constants()` | Performs constant folding |
+| `reorder_pure_ops()` | Commutes pure ops before impure ops |
+| `inline_trivial_io()` | Inlines deterministic IO as constants |
+
+---
+
+## 📊 Visualization
+
+Visualize lifetimes and borrows with:
+
+```bash
+$ ./totem.py --visualize
+```
+
+The graph displays:
+- Nodes colored by purity (`green=pure`, `yellow=state`, `red=io`)
+- Dashed edges for borrows
+- Nested scopes as clusters
+
+---
+
+## 🧱 Architecture Roadmap
+
+| Phase | Goal | Description |
+|-------|------|-------------|
+| I | Core Runtime | Structural decompressor, evaluator, bitcode |
+| II | Meta Runtime | Reflection, TIR mutation, optimizers |
+| III | Formal Semantics | Add symbolic typing, proof-carrying code |
+| IV | Totem VM | Execute TIR as bytecode or LLVM IR |
+| V | Distributed Provenance | Peer-signed logbook synchronization |
