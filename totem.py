@@ -26,6 +26,7 @@ Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 """
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime
 import difflib
 import hashlib
@@ -59,6 +60,7 @@ OPS = {
     "E": {"grade": "pure"},
     "F": {"grade": "pure"},
     "G": {"grade": "io"},
+    "S": {"grade": "sys"},
 }
 
 LOGBOOK_FILE = "totem.logbook.jsonl"
@@ -118,6 +120,143 @@ class Node:
 
     def __repr__(self):
         return f"<{self.op}:{self.typ}@{self.scope.name}>"
+
+
+class Capability:
+    """Linear capability token tracking resource usage."""
+
+    def __init__(
+        self,
+        kind,
+        resource=None,
+        *,
+        state=None,
+        history=None,
+        generation=0,
+        active=True,
+    ):
+        self.kind = kind
+        self.resource = resource
+        self.state = state or {}
+        self.history = history or []
+        self.generation = generation
+        self._active = active
+
+    def evolve(self, action, detail=None, state_updates=None):
+        if not self._active:
+            raise RuntimeError(f"Capability {self} already consumed")
+
+        new_state = dict(self.state)
+        if state_updates:
+            for key, value in state_updates.items():
+                new_state[key] = value
+
+        new_history = list(self.history)
+        new_history.append({"action": action, "detail": detail})
+
+        self._active = False
+
+        return Capability(
+            self.kind,
+            self.resource,
+            state=new_state,
+            history=new_history,
+            generation=self.generation + 1,
+        )
+
+    @property
+    def is_active(self):
+        return self._active
+
+    def __repr__(self):
+        return f"<Capability {self.kind}@{self.generation}>"
+
+
+@dataclass(frozen=True)
+class CapabilityUseResult:
+    capability: Capability
+    value: object = None
+
+
+def resolve_value(value):
+    if isinstance(value, CapabilityUseResult):
+        return value.value
+    return value
+
+
+def extract_capability(value):
+    if isinstance(value, CapabilityUseResult):
+        return value.capability
+    if isinstance(value, Capability):
+        return value
+    return None
+
+
+def _clone_list(source):
+    return list(source) if source is not None else []
+
+
+def use_file_read(cap):
+    index = cap.state.get("index", 0)
+    contents = cap.state.get("contents", [])
+    if index < len(contents):
+        data = contents[index]
+    else:
+        data = None
+    new_cap = cap.evolve("read", data, {"index": index + 1})
+    return CapabilityUseResult(new_cap, data)
+
+
+def use_file_write(cap, payload):
+    writes = _clone_list(cap.state.get("writes", []))
+    writes.append(payload)
+    new_cap = cap.evolve("write", payload, {"writes": writes})
+    return CapabilityUseResult(new_cap, True)
+
+
+def use_net_send(cap, payload):
+    transmissions = _clone_list(cap.state.get("transmissions", []))
+    transmissions.append(payload)
+    ack = f"sent:{payload}"
+    new_cap = cap.evolve("send", payload, {"transmissions": transmissions})
+    return CapabilityUseResult(new_cap, ack)
+
+
+CAPABILITY_FACTORIES = {
+    "FileRead": lambda: Capability(
+        "FileRead",
+        resource="input",
+        state={"index": 0, "contents": ["input_data"]},
+    ),
+    "FileWrite": lambda: Capability(
+        "FileWrite",
+        resource="output",
+        state={"writes": []},
+    ),
+    "NetSend": lambda: Capability(
+        "NetSend",
+        resource="socket",
+        state={"transmissions": []},
+    ),
+}
+
+
+def create_default_environment():
+    env = {"__capabilities__": {}}
+    for kind, factory in CAPABILITY_FACTORIES.items():
+        env["__capabilities__"][kind] = factory()
+    return env
+
+
+def ensure_capability(env, kind):
+    caps = env.setdefault("__capabilities__", {})
+    if kind not in caps:
+        caps[kind] = CAPABILITY_FACTORIES[kind]()
+    return caps[kind]
+
+
+def store_capability(env, kind, capability):
+    env.setdefault("__capabilities__", {})[kind] = capability
 
 
 class IRNode:
@@ -476,20 +615,41 @@ def evaluate_node(node, env):
         env["counter"] = env.get("counter", 0) + 1
         return Effect("state", env["counter"], [f"B:inc->{env['counter']}"])
     elif op == "C":  # IO read (simulated)
-        val = "input_data"
-        return Effect("io", val, [f"C:read->{val}"])
+        borrowed_cap = None
+        if node.borrows:
+            borrowed_cap = extract_capability(env.get(node.borrows[0].target.id))
+        capability = borrowed_cap or ensure_capability(env, "FileRead")
+        result = use_file_read(capability)
+        store_capability(env, "FileRead", result.capability)
+        log_val = result.value if result.value is not None else "EOF"
+        return Effect("io", result, [f"C:read->{log_val}"])
     elif op == "D":
         return lift(2)
     elif op == "E":
         # use borrowed value if available
         src = node.borrows[0].target.id if node.borrows else None
-        val = env.get(src, 0) + 3
+        base = resolve_value(env.get(src, 0)) if src else 0
+        base = base or 0
+        val = base + 3
         return lift(val)
     elif op == "F":
         return lift(5)
     elif op == "G":  # IO write (simulated)
-        msg = f"G:write({env.get(node.borrows[0].target.id, '?')})"
-        return Effect("io", True, [msg])
+        payload_id = node.borrows[0].target.id if node.borrows else None
+        payload = resolve_value(env.get(payload_id)) if payload_id else None
+        capability = ensure_capability(env, "FileWrite")
+        result = use_file_write(capability, payload)
+        store_capability(env, "FileWrite", result.capability)
+        msg = f"G:write({payload})"
+        return Effect("io", result, [msg])
+    elif op == "S":  # Network send (simulated)
+        payload_id = node.borrows[0].target.id if node.borrows else None
+        payload = resolve_value(env.get(payload_id)) if payload_id else None
+        capability = ensure_capability(env, "NetSend")
+        result = use_net_send(capability, payload)
+        store_capability(env, "NetSend", result.capability)
+        msg = f"S:send({payload})"
+        return Effect("sys", result, [msg])
     else:
         return lift(0)
 
@@ -499,7 +659,13 @@ def evaluate_scope(scope, env=None):
     Evaluate a scope: every node returns an Effect.
     The scope's total grade is the max grade of its children.
     """
-    env = env or {}
+    if env is None:
+        env = create_default_environment()
+    else:
+        caps = env.setdefault("__capabilities__", {})
+        for kind, factory in CAPABILITY_FACTORIES.items():
+            if kind not in caps:
+                caps[kind] = factory()
     effects = []
     scope_grade_index = 0
 

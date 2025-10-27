@@ -5,7 +5,13 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from totem import EFFECT_GRADES, evaluate_scope, structural_decompress
+from totem import (
+    EFFECT_GRADES,
+    CapabilityUseResult,
+    create_default_environment,
+    evaluate_scope,
+    structural_decompress,
+)
 
 
 def collect_scopes(scope):
@@ -54,3 +60,49 @@ def test_root_grade_matches_max_child(sample_root):
     result = evaluate_scope(sample_root)
     expected_idx = compute_expected_grade(sample_root)
     assert result.grade == EFFECT_GRADES[expected_idx]
+
+
+def test_file_read_capability_linear_progression():
+    env = create_default_environment()
+    initial_cap = env["__capabilities__"]["FileRead"]
+    root = structural_decompress("cc")
+    result = evaluate_scope(root, env)
+
+    read_cap = env["__capabilities__"]["FileRead"]
+    assert read_cap.generation == initial_cap.generation + 2
+    assert len(read_cap.history) == 2
+    assert not initial_cap.is_active
+    assert result.grade == "io"
+
+
+def test_file_write_capability_records_payload():
+    env = create_default_environment()
+    root = structural_decompress("{fg}")
+    evaluate_scope(root, env)
+
+    write_cap = env["__capabilities__"]["FileWrite"]
+    assert write_cap.history[-1]["action"] == "write"
+    assert write_cap.history[-1]["detail"] == 5
+    assert write_cap.state["writes"] == [5]
+
+    g_node = root.children[0].nodes[-1]
+    result_value = env[g_node.owned_life.id]
+    assert isinstance(result_value, CapabilityUseResult)
+    assert result_value.value is True
+
+
+def test_net_send_capability_updates_and_returns_result():
+    env = create_default_environment()
+    root = structural_decompress("as")
+    result = evaluate_scope(root, env)
+
+    assert result.grade == "sys"
+
+    net_cap = env["__capabilities__"]["NetSend"]
+    assert net_cap.history[-1]["action"] == "send"
+    assert net_cap.history[-1]["detail"] == 1
+
+    s_node = root.nodes[-1]
+    stored = env[s_node.owned_life.id]
+    assert isinstance(stored, CapabilityUseResult)
+    assert stored.value == "sent:1"
