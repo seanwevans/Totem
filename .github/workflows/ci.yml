@@ -66,8 +66,14 @@ jobs:
           python -m coverage report -m
           python -m coverage xml
 
-      - name: Upload coverage report artifact
+      - name: Generate coverage badge
+        run: |
+          python scripts/generate_coverage_badge.py coverage.xml coverage.svg
+
+      - name: Upload coverage artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-xml
-          path: coverage.xml
+          name: coverage-reports
+          path: |
+            coverage.xml
+            coverage.svg
