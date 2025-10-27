@@ -1493,6 +1493,8 @@ def export_graphviz(root, output_path):
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("Graphviz export requires pydot to be installed") from exc
 
+    import pydot
+
     graph = pydot.Dot(
         "totem_scopes",
         graph_type="digraph",
@@ -2157,6 +2159,147 @@ def build_tir(scope, program=None, prefix="root"):
     return program
 
 
+def _instruction_identity(instr, scope_counters):
+    """Return a stable identity token for a TIR instruction."""
+
+    if instr.produces:
+        return ("life", instr.produces)
+
+    idx = scope_counters.setdefault(instr.scope_path, 0)
+    scope_counters[instr.scope_path] = idx + 1
+    return ("scope", instr.scope_path, idx)
+
+
+def _normalize_args(args):
+    normalized = []
+    for arg in args:
+        if isinstance(arg, dict):
+            normalized.append((arg.get("kind"), arg.get("target")))
+        else:
+            normalized.append((None, arg))
+    return normalized
+
+
+def compute_tir_distance(tir_a, tir_b):
+    """Compute a semantic distance between two TIR programs.
+
+    The metric is a tuple of edit components:
+
+    • node_edits — instruction insertions/deletions.
+    • grade_delta — cumulative absolute difference across effect grades.
+    • op_changes — opcode substitutions for matching instruction identities.
+    • type_changes — result type substitutions for matching instruction identities.
+    • borrow_rewires — argument rewires (kind/target changes).
+
+    The total distance is the sum of the components. This yields a coarse yet
+    stable measure of how far two programs diverge semantically.
+    """
+
+    def map_instructions(tir):
+        mapping = {}
+        scope_counters = {}
+        for instr in tir.instructions:
+            key = _instruction_identity(instr, scope_counters)
+            # In practice keys are unique, but we guard against collisions by
+            # appending a disambiguator.
+            if key in mapping:
+                suffix = 1
+                new_key = key + (suffix,)
+                while new_key in mapping:
+                    suffix += 1
+                    new_key = key + (suffix,)
+                key = new_key
+            mapping[key] = instr
+        return mapping
+
+    map_a = map_instructions(tir_a)
+    map_b = map_instructions(tir_b)
+
+    node_edits = 0
+    grade_delta = 0
+    op_changes = 0
+    type_changes = 0
+    borrow_rewires = 0
+
+    all_keys = set(map_a) | set(map_b)
+    for key in all_keys:
+        instr_a = map_a.get(key)
+        instr_b = map_b.get(key)
+        if instr_a is None or instr_b is None:
+            node_edits += 1
+            continue
+
+        if instr_a.op != instr_b.op:
+            op_changes += 1
+
+        if instr_a.typ != instr_b.typ:
+            type_changes += 1
+
+        if instr_a.grade != instr_b.grade:
+            grade_delta += abs(
+                EFFECT_GRADES.index(instr_a.grade)
+                - EFFECT_GRADES.index(instr_b.grade)
+            )
+
+        args_a = _normalize_args(instr_a.args)
+        args_b = _normalize_args(instr_b.args)
+        max_len = max(len(args_a), len(args_b))
+        for idx in range(max_len):
+            item_a = args_a[idx] if idx < len(args_a) else None
+            item_b = args_b[idx] if idx < len(args_b) else None
+            if item_a != item_b:
+                borrow_rewires += 1
+
+    total = node_edits + grade_delta + op_changes + type_changes + borrow_rewires
+    return {
+        "node_edits": node_edits,
+        "grade_delta": grade_delta,
+        "op_changes": op_changes,
+        "type_changes": type_changes,
+        "borrow_rewires": borrow_rewires,
+        "total": total,
+    }
+
+
+def _mutate_byte(ch):
+    code = ord(ch)
+    if 32 <= code <= 126:
+        return chr(32 + ((code - 32 + 1) % 95))
+    return chr((code + 1) % 0x110000)
+
+
+def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
+    """Measure how semantics shift under single-byte mutations.
+
+    Each byte is rotated to the next printable ASCII character (configurable
+    via ``mutate_fn``). We rebuild the TIR for the mutated source and compute
+    the semantic distance against ``base_tir``.
+    """
+
+    mutate_fn = mutate_fn or _mutate_byte
+    if base_tir is None:
+        base_tir = build_tir(structural_decompress(src))
+
+    profile = []
+    for idx, ch in enumerate(src):
+        mutated_char = mutate_fn(ch)
+        if mutated_char == ch:
+            continue
+        mutated_src = f"{src[:idx]}{mutated_char}{src[idx + 1:]}"
+        mutated_tree = structural_decompress(mutated_src)
+        mutated_tir = build_tir(mutated_tree)
+        dist = compute_tir_distance(base_tir, mutated_tir)
+        profile.append(
+            {
+                "index": idx,
+                "original": ch,
+                "mutated": mutated_char,
+                "mutated_src": mutated_src,
+                "distance": dist,
+            }
+        )
+
+    return profile
 def _wasm_local_name(identifier):
     return f"${identifier}"
 
@@ -3108,6 +3251,25 @@ def main(args):
     print("\nTIR:")
     print(tir)
 
+    profile = continuous_semantics_profile(params.src, base_tir=tir)
+    print("\nContinuous semantics (Δ per byte):")
+    if not profile:
+        print("  (no bytes to mutate)")
+    else:
+        for entry in profile:
+            dist = entry["distance"]
+            print(
+                "  idx {idx}: {orig!r}->{mut!r} Δtotal={total} "
+                "(nodes={nodes}, grades={grades}, borrows={borrows})".format(
+                    idx=entry["index"],
+                    orig=entry["original"],
+                    mut=entry["mutated"],
+                    total=dist["total"],
+                    nodes=dist["node_edits"],
+                    grades=dist["grade_delta"],
+                    borrows=dist["borrow_rewires"],
+                )
+            )
     if params.wasm:
         try:
             export_wasm_module(
