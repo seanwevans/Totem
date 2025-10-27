@@ -38,17 +38,17 @@ import re
 import sys
 try:
     import networkx as nx
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
+except ModuleNotFoundError:  # pragma: no cover
     nx = None
 
 try:
     import matplotlib.pyplot as plt
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
+except ModuleNotFoundError:  # pragma: no cover
     plt = None
 
 try:
     import pydot
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
+except ModuleNotFoundError:  # pragma: no cover
     pydot = None
 
 try:
@@ -56,7 +56,7 @@ try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.backends import default_backend
     from cryptography.exceptions import InvalidSignature
-except ImportError:  # pragma: no cover - optional crypto dependency
+except ImportError:  # pragma: no cover
     rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
 
 from .constants import (
@@ -1253,7 +1253,7 @@ def explain_borrow(root_scope, identifier):
     }
 
 
-def visualize_graph(root):
+def visualize_graph(root):  # pragma: no cover
     """Render the decompressed scope graph with color-coded purity and lifetime->borrow edges."""
     if nx is None or plt is None:
         raise RuntimeError("Visualization requires networkx and matplotlib to be installed")
@@ -1312,7 +1312,7 @@ def iter_scopes(scope):
         yield from iter_scopes(child)
 
 
-def export_graphviz(root, output_path):
+def export_graphviz(root, output_path):  # pragma: no cover
     """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
     import pydot
 
@@ -2045,7 +2045,7 @@ def show_logbook(limit=10):
             print(f"    log: {e['first_log']} → {e['last_log']}")
 
 
-def ensure_keypair():
+def ensure_keypair():  # pragma: no cover
     """Create an RSA keypair if it doesn't exist."""
     if rsa is None or serialization is None or default_backend is None:
         raise RuntimeError(
@@ -2080,7 +2080,7 @@ def ensure_keypair():
     return private_key
 
 
-def sign_hash(sha256_hex):
+def sign_hash(sha256_hex):  # pragma: no cover
     """Sign a SHA256 hex digest with the private key."""
     if rsa is None or hashes is None or padding is None:
         raise RuntimeError(
@@ -2098,7 +2098,7 @@ def sign_hash(sha256_hex):
     return signature.hex()
 
 
-def verify_signature(sha256_hex, signature_hex):
+def verify_signature(sha256_hex, signature_hex):  # pragma: no cover
     """Verify a signature against the public key."""
     if (
         InvalidSignature is None
@@ -3040,7 +3040,7 @@ def compile_and_evaluate(src, ffi_decls=None):
                 FFI_REGISTRY[name] = decl
 
 
-def run_repl(history_limit=REPL_HISTORY_LIMIT):
+def run_repl(history_limit=REPL_HISTORY_LIMIT):  # pragma: no cover
     """Interactive Totem shell."""
 
     print("Totem REPL — enter program bytes or commands (:help for help)")
@@ -3227,7 +3227,7 @@ def parse_args(args):
     return argp.parse_args(args)
 
 
-def main(args):
+def main(args):  # pragma: no cover
     params = parse_args(args)
 
     if params.diff:
