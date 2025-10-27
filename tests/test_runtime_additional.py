@@ -14,6 +14,7 @@ from totem.runtime import (
     ActorCapability,
     IRNode,
     Borrow,
+    BytecodeResult,
     BytecodeInstruction,
     BytecodeProgram,
     BytecodeVM,
@@ -374,10 +375,19 @@ def test_evaluate_node_meta_and_effects():
     root.nodes.append(node_l)
 
     env = create_default_environment()
-    assert evaluate_node(node_m, env).grade == "meta"
-    assert evaluate_node(node_n, env).grade == "meta"
+    effect_m = evaluate_node(node_m, env)
+    assert effect_m.grade == "meta"
+    env[node_m.owned_life.id] = effect_m.value
+    node_n.borrows.append(Borrow("mut", node_m.owned_life, root))
+    node_m.owned_life.borrows.append(node_n.borrows[0])
+    effect_n = evaluate_node(node_n, env)
+    assert effect_n.grade == "meta"
+    env[node_n.owned_life.id] = effect_n.value
+    node_o.borrows.append(Borrow("shared", node_n.owned_life, root))
+    node_n.owned_life.borrows.append(node_o.borrows[0])
     optimized = evaluate_node(node_o, env)
     assert optimized.grade == "meta"
+    env[node_o.owned_life.id] = optimized.value
 
     actor_system_effect = evaluate_node(node_h, env)
     assert actor_system_effect.grade == "sys"
@@ -398,6 +408,29 @@ def test_evaluate_node_meta_and_effects():
     send_effect = evaluate_node(node_l, env)
     assert send_effect.grade == "sys"
 
+
+def test_meta_compiler_executes_attached_script():
+    tree = structural_decompress("MN{AB}OQ")
+    env = create_default_environment()
+    result = evaluate_scope(tree, env)
+
+    assert any(entry.startswith("N:emit(") for entry in result.log)
+    assert any(entry.startswith("Q:run(") for entry in result.log)
+
+    all_nodes = [
+        node for scope in runtime_mod.iter_scopes(tree) for node in scope.nodes
+    ]
+    node_o = next(node for node in all_nodes if node.op == "O")
+    meta_value = env[node_o.owned_life.id]
+    assert isinstance(meta_value, MetaObject)
+    tir = meta_value.data
+    appended_ops = [instr.op for instr in tir.instructions]
+    assert "B" in appended_ops
+
+    node_q = next(node for node in all_nodes if node.op == "Q")
+    bytecode_result = env[node_q.owned_life.id]
+    assert isinstance(bytecode_result, BytecodeResult)
+    assert any(entry.startswith("B:inc") for entry in bytecode_result.log)
 
 
 def test_irnode_and_emitters_cover_branches():

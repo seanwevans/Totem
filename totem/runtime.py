@@ -150,6 +150,7 @@ class Node:
         self.ffi = None
         self.ffi_capabilities = []
         self.meta = {}
+        self.attached_scopes = []
         self.arity = 0
         self._apply_ffi_metadata()
         self.update_type()
@@ -337,6 +338,7 @@ class Scope:
         self.drops = []
         self.effect_cap = effect_cap
         self.fence = fence
+        self.meta_role = None
         if parent:
             parent.children.append(self)
 
@@ -975,6 +977,13 @@ def structural_decompress(src):
                 effect_cap=inherited_cap,
                 fence=info["label"],
             )
+            if (
+                last_node
+                and last_node.scope is current
+                and getattr(last_node, "grade", "pure") == "meta"
+            ):
+                last_node.attached_scopes.append(s)
+                s.meta_role = "attached"
             stack.append((s, info["close"], ch))
         elif ch in closers:
             if len(stack) == 1:
@@ -988,6 +997,11 @@ def structural_decompress(src):
                 n.owned_life.end_scope = scope
                 scope.lifetimes.append(n.owned_life)
                 scope.drops.append(n.owned_life)
+            parent_scope = scope.parent
+            if parent_scope and parent_scope.nodes:
+                last_node = parent_scope.nodes[-1]
+            else:
+                last_node = None
         elif ch.isalpha():
             node = Node(op=ch.upper(), typ="int32", scope=current)
             cap = current.effect_cap
@@ -1027,6 +1041,8 @@ def check_aliasing(scope, errors):
             errors.append(f"Multiple mutable borrows of {life.id} in {scope.name}")
 
     for child in scope.children:
+        if getattr(child, "meta_role", None) == "attached":
+            continue
         check_aliasing(child, errors)
 
 
@@ -1036,6 +1052,8 @@ def check_lifetimes(scope, errors):
             if _scope_depth(b.borrower_scope) > _scope_depth(life.end_scope):
                 errors.append(f"Borrow {b} outlives {life.id}")
     for child in scope.children:
+        if getattr(child, "meta_role", None) == "attached":
+            continue
         check_lifetimes(child, errors)
 
 
@@ -1070,6 +1088,8 @@ def verify_ffi_calls(scope, errors):
                     f"FFI {decl.name} grade mismatch: expected {decl.grade}, got {node.grade}"
                 )
     for child in scope.children:
+        if getattr(child, "meta_role", None) == "attached":
+            continue
         verify_ffi_calls(child, errors)
 
 
@@ -1091,6 +1111,8 @@ def compute_scope_grades(scope, grades=None):
     for node in scope.nodes:
         idx = max(idx, EFFECT_GRADES.index(node.grade))
     for child in scope.children:
+        if getattr(child, "meta_role", None) == "attached":
+            continue
         child_idx = compute_scope_grades(child, grades)
         idx = max(idx, child_idx)
 
@@ -1441,19 +1463,51 @@ def evaluate_node(node, env):
         return Effect(node.grade, None, [log])
 
     # Meta-level operations (demo)
-    if op == "M":  # reflect current TIR
-        tir = build_tir(node.scope)
-        return Effect("meta", reflect(tir), [f"M:reflect({len(tir.instructions)})"])
-    elif op == "N":  # dynamically emit a node into TIR
-        tir = build_tir(node.scope)
-        meta_instr = meta_emit(tir, "X", "int32", "pure")
-        return Effect("meta", meta_instr, [f"N:emit({meta_instr})"])
+    if op == "M":  # reflect current scope into a mutable TIR session
+        base_tir = build_tir(node.scope, include_attached=False)
+        session = TIRProgram()
+        meta_obj = MetaObject("TIR", session)
+        return Effect("meta", meta_obj, [f"M:reflect({len(base_tir.instructions)})"])
+    elif op == "N":  # compile attached meta scope into the borrowed TIR
+        if not node.borrows:
+            raise RuntimeError("N requires borrowing a TIR MetaObject")
+        borrowed_id = node.borrows[0].target.id
+        meta_value = read_env_value(env, borrowed_id)
+        program = _unwrap_meta_tir(meta_value)
+        before = len(program.instructions)
+        attached_scopes = node.attached_scopes
+        for idx, script_scope in enumerate(attached_scopes):
+            scope_path = f"meta_script_{script_scope.name}_{idx}"
+            build_tir(
+                script_scope,
+                program,
+                prefix=scope_path,
+                include_attached=True,
+            )
+        added = len(program.instructions) - before
+        log = [f"N:emit({added} instrs)"]
+        return Effect("meta", meta_value, log)
     elif op == "O":  # run optimizer (meta)
-        tir = build_tir(node.scope)
-        optimized = optimize_tir(tir)
+        if not node.borrows:
+            raise RuntimeError("O requires borrowing a TIR MetaObject")
+        borrowed_id = node.borrows[0].target.id
+        meta_value = read_env_value(env, borrowed_id)
+        program = _unwrap_meta_tir(meta_value)
+        optimized = optimize_tir(program)
+        meta_obj = MetaObject("TIR", optimized)
         return Effect(
-            "meta", reflect(optimized), [f"O:optimize({len(optimized.instructions)} instrs)"]
+            "meta", meta_obj, [f"O:optimize({len(optimized.instructions)} instrs)"]
         )
+    elif op == "Q":  # execute the borrowed TIR using the bytecode VM
+        if not node.borrows:
+            raise RuntimeError("Q requires borrowing a TIR MetaObject")
+        borrowed_id = node.borrows[0].target.id
+        meta_value = read_env_value(env, borrowed_id)
+        program = _unwrap_meta_tir(meta_value)
+        bytecode = assemble_bytecode(program)
+        result = run_bytecode(bytecode)
+        log = [f"Q:run({len(program.instructions)} instrs)", *result.log]
+        return Effect("meta", result, log)
 
     # demo semantics
     if op == "A":  # pure constant
@@ -1567,6 +1621,8 @@ def evaluate_scope(scope, env=None):
         scope_grade_index = max(scope_grade_index, EFFECT_GRADES.index(eff.grade))
 
     for child in scope.children:
+        if getattr(child, "meta_role", None) == "attached":
+            continue
         sub_eff = evaluate_scope(child, env)
         effects.append(sub_eff)
         scope_grade_index = max(scope_grade_index, EFFECT_GRADES.index(sub_eff.grade))
@@ -1619,7 +1675,11 @@ def scope_to_dict(scope):
             for n in scope.nodes
         ],
         "drops": [l.id for l in scope.drops],
-        "children": [scope_to_dict(child) for child in scope.children],
+        "children": [
+            scope_to_dict(child)
+            for child in scope.children
+            if getattr(child, "meta_role", None) != "attached"
+        ],
     }
 
 
@@ -1637,6 +1697,8 @@ def _collect_aliasing_payload(scope):
     borrows = []
 
     for sc in iter_scopes(scope):
+        if getattr(sc, "meta_role", None) == "attached":
+            continue
         scope_path = _scope_path(sc)
         for life in sc.lifetimes:
             record = {
@@ -1710,6 +1772,8 @@ def _collect_grade_payload(scope):
     max_grade_index = 0
 
     for sc in iter_scopes(scope):
+        if getattr(sc, "meta_role", None) == "attached":
+            continue
         for node in sc.nodes:
             node_entries.append({"id": node.id, "grade": node.grade})
             max_grade_index = max(max_grade_index, EFFECT_GRADES.index(node.grade))
@@ -2129,7 +2193,7 @@ def verify_signature(sha256_hex, signature_hex):  # pragma: no cover
         return False
 
 
-def build_tir(scope, program=None, prefix="root"):
+def build_tir(scope, program=None, prefix="root", include_attached=False):
     """Lower a full scope tree into a flat TIRProgram."""
     if program is None:
         program = TIRProgram()
@@ -2186,7 +2250,9 @@ def build_tir(scope, program=None, prefix="root"):
         )
 
     for child in scope.children:
-        build_tir(child, program, scope_path)
+        if getattr(child, "meta_role", None) == "attached" and not include_attached:
+            continue
+        build_tir(child, program, scope_path, include_attached=include_attached)
 
     if prefix == "root":
         program.desugar_pattern_matches()
@@ -2567,6 +2633,16 @@ def meta_emit(
     vid = program.emit(op, typ, grade, args, scope_path)
     instr = program.instructions[-1]
     return MetaObject("TIR_Instruction", instr)
+
+
+def _unwrap_meta_tir(value):
+    if isinstance(value, MetaObject):
+        if value.kind != "TIR":
+            raise RuntimeError("Meta operation requires a TIR MetaObject")
+        return value.data
+    if isinstance(value, TIRProgram):
+        return value
+    raise RuntimeError("Meta operation requires a TIR MetaObject")
 
 
 def list_meta_ops():

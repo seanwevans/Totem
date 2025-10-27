@@ -24,6 +24,10 @@ OPS = {
     "L": {"grade": "sys"},
     "P": {"grade": "sys"},
     "S": {"grade": "sys"},
+    "M": {"grade": "meta"},
+    "N": {"grade": "meta"},
+    "O": {"grade": "meta"},
+    "Q": {"grade": "meta"},
 }
 
 IO_IMPORTS = {
