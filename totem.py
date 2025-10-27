@@ -575,8 +575,133 @@ def scope_to_dict(scope):
     }
 
 
+def _certificate_payload_digest(payload):
+    """Return a stable digest for certificate payloads."""
+
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _collect_aliasing_payload(scope):
+    lifetimes = []
+    lifetime_counts = {}
+    borrows = []
+
+    for sc in iter_scopes(scope):
+        scope_path = _scope_path(sc)
+        for life in sc.lifetimes:
+            record = {
+                "id": life.id,
+                "owner": scope_path,
+                "end": life.end_scope.name if life.end_scope else None,
+            }
+            lifetimes.append(record)
+            lifetime_counts[life.id] = lifetime_counts.get(life.id, 0) + 1
+
+        for node in sc.nodes:
+            for borrow in node.borrows:
+                borrows.append(
+                    {
+                        "node": node.id,
+                        "kind": borrow.kind,
+                        "target": borrow.target.id,
+                    }
+                )
+
+    lifetimes.sort(key=lambda x: (x["id"], x["owner"], x.get("end")))
+    borrows.sort(key=lambda x: (x["node"], x["kind"], x["target"]))
+
+    duplicates = sorted([lid for lid, count in lifetime_counts.items() if count > 1])
+    declared = {life["id"] for life in lifetimes}
+    dangling = sorted({b["target"] for b in borrows if b["target"] not in declared})
+
+    alias_errors = []
+    check_aliasing(scope, alias_errors)
+
+    payload = {
+        "lifetimes": lifetimes,
+        "borrows": borrows,
+        "duplicate_lifetimes": duplicates,
+        "dangling_borrows": dangling,
+        "alias_errors": alias_errors,
+    }
+
+    ok = not duplicates and not dangling and not alias_errors
+
+    summary = {
+        "lifetimes": len(lifetimes),
+        "borrows": len(borrows),
+        "duplicate_lifetimes": duplicates,
+        "dangling_borrows": dangling,
+        "alias_errors": alias_errors,
+    }
+
+    return {
+        "statement": "All borrows reference valid lifetimes without aliasing conflicts.",
+        "payload_digest": _certificate_payload_digest(payload),
+        "summary": summary,
+        "ok": ok,
+    }
+
+
+def _collect_grade_payload(scope):
+    node_entries = []
+    max_grade_index = 0
+
+    for sc in iter_scopes(scope):
+        for node in sc.nodes:
+            node_entries.append({"id": node.id, "grade": node.grade})
+            max_grade_index = max(max_grade_index, EFFECT_GRADES.index(node.grade))
+
+    node_entries.sort(key=lambda x: x["id"])
+    computed_grade = EFFECT_GRADES[max_grade_index] if node_entries else EFFECT_GRADES[0]
+
+    payload = {
+        "node_grades": node_entries,
+        "computed_grade": computed_grade,
+    }
+
+    return payload
+
+
+def _grade_certificate(scope, reported_grade):
+    payload = _collect_grade_payload(scope)
+    computed_grade = payload["computed_grade"]
+    ok = reported_grade == computed_grade
+
+    summary = {
+        "node_count": len(payload["node_grades"]),
+        "computed_grade": computed_grade,
+        "reported_grade": reported_grade,
+    }
+
+    return {
+        "statement": "Program grade matches the maximum grade of its nodes.",
+        "payload_digest": _certificate_payload_digest(payload),
+        "summary": summary,
+        "ok": ok,
+    }
+
+
+def build_bitcode_certificates(scope, final_grade):
+    aliasing = _collect_aliasing_payload(scope)
+    if not aliasing["ok"]:
+        raise ValueError(f"Alias analysis failed: {aliasing['summary']}")
+
+    grade = _grade_certificate(scope, final_grade)
+    if not grade["ok"]:
+        raise ValueError(
+            "Effect grade proof failed: "
+            f"expected {grade['summary']['computed_grade']} got {final_grade}"
+        )
+
+    return {"aliasing": aliasing, "grades": grade}
+
+
 def build_bitcode_document(scope, result_effect):
     """Create an in-memory Totem Bitcode representation."""
+
+    certificates = build_bitcode_certificates(scope, result_effect.grade)
 
     return {
         "totem_version": "0.5",
@@ -586,6 +711,7 @@ def build_bitcode_document(scope, result_effect):
             "final_grade": result_effect.grade,
             "log": result_effect.log,
         },
+        "certificates": certificates,
     }
 
 
@@ -608,6 +734,7 @@ def load_totem_bitcode(filename):
     """Load a serialized Totem Bitcode JSON (for later reconstruction)."""
     with open(filename, "r", encoding="utf-8") as f:
         doc = json.load(f)
+    verify_bitcode_document(doc)
     return doc
 
 
@@ -619,6 +746,7 @@ def reconstruct_scope(scope_dict, parent=None):
     life_map = {}
     for ninfo in scope_dict["nodes"]:
         node = Node(ninfo["op"], ninfo["type"], scope)
+        node.id = ninfo["id"]
         node.grade = ninfo["grade"]
         node.owned_life.id = ninfo["lifetime_id"]
         life_map[node.owned_life.id] = node.owned_life
@@ -628,6 +756,12 @@ def reconstruct_scope(scope_dict, parent=None):
     for linfo in scope_dict.get("lifetimes", []):
         l = Lifetime(scope, linfo["id"])
         l.owner_scope = scope
+        end_name = linfo.get("end_scope")
+        if end_name:
+            target = scope
+            while target and target.name != end_name:
+                target = target.parent
+            l.end_scope = target
         scope.lifetimes.append(l)
         life_map[l.id] = l
 
@@ -650,6 +784,41 @@ def reconstruct_scope(scope_dict, parent=None):
         reconstruct_scope(child_dict, scope)
 
     return scope
+
+
+def _validate_certificate(name, stored, expected):
+    if not stored:
+        raise ValueError(f"Bitcode missing {name} certificate")
+
+    if stored.get("payload_digest") != expected["payload_digest"]:
+        raise ValueError(f"{name} certificate digest mismatch")
+
+    if stored.get("summary") != expected["summary"]:
+        raise ValueError(f"{name} certificate summary mismatch")
+
+    if not stored.get("ok"):
+        raise ValueError(f"{name} certificate indicates failure: {stored['summary']}")
+
+    if not expected.get("ok"):
+        raise ValueError(f"{name} certificate recomputation failed: {expected['summary']}")
+
+
+def verify_bitcode_document(doc):
+    """Ensure embedded certificates match reconstructed program state."""
+
+    certificates = doc.get("certificates")
+    if not certificates:
+        raise ValueError("Totem bitcode missing proof certificates")
+
+    scope = reconstruct_scope(doc["root_scope"])
+
+    alias_expected = _collect_aliasing_payload(scope)
+    grade_expected = _grade_certificate(scope, doc["evaluation"]["final_grade"])
+
+    _validate_certificate("aliasing", certificates.get("aliasing"), alias_expected)
+    _validate_certificate("grades", certificates.get("grades"), grade_expected)
+
+    return True
 
 
 def reexecute_bitcode(filename):
