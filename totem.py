@@ -31,16 +31,9 @@ import difflib
 import hashlib
 import heapq
 import json
+from collections import deque
 from pathlib import Path
 import sys
-import networkx as nx
-import matplotlib.pyplot as plt
-import pydot
-
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.backends import default_backend
-from cryptography.exceptions import InvalidSignature
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
 
@@ -60,6 +53,11 @@ OPS = {
     "E": {"grade": "pure"},
     "F": {"grade": "pure"},
     "G": {"grade": "io"},
+    "H": {"grade": "sys"},
+    "J": {"grade": "sys"},
+    "K": {"grade": "pure"},
+    "L": {"grade": "sys"},
+    "P": {"grade": "sys"},
 }
 
 LOGBOOK_FILE = "totem.logbook.jsonl"
@@ -160,6 +158,167 @@ class Effect:
         new_idx = max(EFFECT_GRADES.index(self.grade), EFFECT_GRADES.index(out.grade))
         return Effect(EFFECT_GRADES[new_idx], out.value, self.log + out.log)
 
+
+class MovedValue:
+    """Sentinel stored in the environment when a lifetime has been moved."""
+
+    def __init__(self, origin_id):
+        self.origin_id = origin_id
+
+    def __repr__(self):
+        return f"<moved:{self.origin_id}>"
+
+
+def read_env_value(env, lifetime_id, default=None):
+    """Fetch a lifetime's value while ensuring it has not been moved."""
+
+    if lifetime_id is None:
+        return default
+    if lifetime_id not in env:
+        if default is not None:
+            return default
+        raise KeyError(f"Unknown lifetime {lifetime_id}")
+    val = env[lifetime_id]
+    if isinstance(val, MovedValue):
+        raise RuntimeError(f"Lifetime {lifetime_id} has been moved and is no longer usable")
+    return val
+
+
+def move_env_value(env, lifetime_id):
+    """Mark a lifetime as moved and return its previous value."""
+
+    if lifetime_id is None:
+        raise RuntimeError("Cannot move a value without a lifetime identifier")
+    if lifetime_id not in env:
+        raise KeyError(f"Unknown lifetime {lifetime_id}")
+    val = env[lifetime_id]
+    if isinstance(val, MovedValue):
+        raise RuntimeError(f"Lifetime {lifetime_id} has already been moved")
+    env[lifetime_id] = MovedValue(lifetime_id)
+    return val
+
+
+class OwnedMessage:
+    """A message that must be moved exactly once across actors."""
+
+    def __init__(self, payload, capability, message_id):
+        self.payload = payload
+        self.capability = capability
+        self.message_id = message_id
+        self._moved = False
+
+    def move_payload(self):
+        if self._moved:
+            raise RuntimeError(f"Message {self.message_id} has already been moved")
+        self._moved = True
+        return self.payload
+
+    def __repr__(self):
+        target = getattr(self.capability, "actor_id", "?")
+        return f"<OwnedMessage id={self.message_id}→{target} moved={self._moved}>"
+
+
+class ActorCapability:
+    """Capability used to send messages to a specific actor."""
+
+    def __init__(self, actor_system, actor_id):
+        self.actor_system = actor_system
+        self.actor_id = actor_id
+
+    def send(self, message):
+        return self.actor_system.send(self, message)
+
+    def __repr__(self):
+        return f"<Capability {self.actor_id}>"
+
+
+class Actor:
+    """Single actor with a mailbox and effect-local log."""
+
+    def __init__(self, actor_id, behavior):
+        self.actor_id = actor_id
+        self.behavior = behavior
+        self.mailbox = deque()
+        self.local_log = []
+        self.local_grade_index = EFFECT_GRADES.index("pure")
+
+    def enqueue(self, payload):
+        self.mailbox.append(payload)
+
+    def drain(self):
+        delivered = 0
+        logs = []
+        grade_index = self.local_grade_index
+        while self.mailbox:
+            payload = self.mailbox.popleft()
+            effect = self.behavior(payload)
+            grade_index = max(grade_index, EFFECT_GRADES.index(effect.grade))
+            logs.extend(effect.log)
+            delivered += 1
+        self.local_grade_index = grade_index
+        self.local_log.extend(logs)
+        return delivered, logs, grade_index
+
+
+def default_actor_behavior(payload):
+    return Effect("state", {"last_message": payload}, [f"echo:{payload}"])
+
+
+class ActorSystem:
+    """Ownership-safe actor system with move-only message passing."""
+
+    def __init__(self):
+        self.actors = {}
+        self._actor_counter = 0
+        self._message_counter = 0
+        self._public_log = []
+
+    def spawn(self, behavior=None):
+        behavior = behavior or default_actor_behavior
+        actor_id = f"actor_{self._actor_counter}"
+        self._actor_counter += 1
+        actor = Actor(actor_id, behavior)
+        self.actors[actor_id] = actor
+        return ActorCapability(self, actor_id)
+
+    def next_message_id(self):
+        mid = self._message_counter
+        self._message_counter += 1
+        return mid
+
+    def send(self, capability, message):
+        if message.capability is not capability:
+            raise RuntimeError("Message capability does not match the target actor")
+        payload = message.move_payload()
+        actor = self.actors.get(capability.actor_id)
+        if actor is None:
+            raise RuntimeError(f"Unknown actor {capability.actor_id}")
+        actor.enqueue(payload)
+        log_entry = f"send:{capability.actor_id}:msg{message.message_id}"
+        return Effect("sys", True, [log_entry])
+
+    def run_until_idle(self):
+        delivered = 0
+        logs = []
+        highest_grade = EFFECT_GRADES.index("pure")
+        for actor_id, actor in self.actors.items():
+            count, local_logs, grade_idx = actor.drain()
+            if not count and not local_logs:
+                continue
+            delivered += count
+            highest_grade = max(highest_grade, grade_idx)
+            logs.extend(f"{actor_id}:{entry}" for entry in local_logs)
+        prefix = f"run:delivered={delivered}"
+        if logs:
+            combined = [prefix] + logs
+        else:
+            combined = [prefix]
+        self._public_log = logs
+        return Effect("sys", self, combined)
+
+    @property
+    def last_public_log(self):
+        return list(self._public_log)
 
 class TIRInstruction:
     """Single SSA-like instruction."""
@@ -362,6 +521,8 @@ def iter_scopes(scope):
 def export_graphviz(root, output_path):
     """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
 
+    import pydot
+
     graph = pydot.Dot(
         "totem_scopes",
         graph_type="digraph",
@@ -496,13 +657,62 @@ def evaluate_node(node, env):
     elif op == "E":
         # use borrowed value if available
         src = node.borrows[0].target.id if node.borrows else None
-        val = env.get(src, 0) + 3
+        base = read_env_value(env, src, 0)
+        try:
+            val = base + 3
+        except TypeError:
+            val = 3
         return lift(val)
     elif op == "F":
         return lift(5)
     elif op == "G":  # IO write (simulated)
-        msg = f"G:write({env.get(node.borrows[0].target.id, '?')})"
+        borrow_id = node.borrows[0].target.id if node.borrows else None
+        msg = f"G:write({read_env_value(env, borrow_id, '?')})"
         return Effect("io", True, [msg])
+    elif op == "H":  # create an actor system
+        system = ActorSystem()
+        return Effect("sys", system, ["H:actors"])
+    elif op == "J":  # spawn an actor and return capability
+        if not node.borrows:
+            raise RuntimeError("J requires borrowing an actor system")
+        system = read_env_value(env, node.borrows[0].target.id)
+        if not isinstance(system, ActorSystem):
+            raise RuntimeError("J expects an ActorSystem as input")
+        capability = system.spawn()
+        return Effect("sys", capability, [f"J:spawn({capability.actor_id})"])
+    elif op == "K":  # craft a move-only message for a capability
+        if not node.borrows:
+            raise RuntimeError("K requires borrowing an actor capability")
+        capability = read_env_value(env, node.borrows[0].target.id)
+        if not isinstance(capability, ActorCapability):
+            raise RuntimeError("K expects an ActorCapability as input")
+        message_id = capability.actor_system.next_message_id()
+        payload = {"message": message_id, "to": capability.actor_id}
+        message = OwnedMessage(payload, capability, message_id)
+        return Effect("pure", message, [f"K:msg({capability.actor_id},id={message_id})"])
+    elif op == "L":  # move the message into the actor system
+        if not node.borrows:
+            raise RuntimeError("L requires moving an OwnedMessage")
+        borrow_id = node.borrows[0].target.id
+        message = move_env_value(env, borrow_id)
+        if not isinstance(message, OwnedMessage):
+            raise RuntimeError("L expects an OwnedMessage to send")
+        capability = message.capability
+        send_effect = capability.send(message)
+        logs = [
+            f"L:send({capability.actor_id},id={message.message_id})",
+            *send_effect.log,
+        ]
+        return Effect("sys", capability.actor_system, logs)
+    elif op == "P":  # run all actors until their queues are drained
+        if not node.borrows:
+            raise RuntimeError("P requires borrowing an actor system")
+        system = read_env_value(env, node.borrows[0].target.id)
+        if not isinstance(system, ActorSystem):
+            raise RuntimeError("P expects an ActorSystem as input")
+        run_effect = system.run_until_idle()
+        logs = ["P:run"] + run_effect.log
+        return Effect("sys", system, logs)
     else:
         return lift(0)
 

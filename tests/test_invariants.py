@@ -5,7 +5,13 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from totem import EFFECT_GRADES, evaluate_scope, structural_decompress
+from totem import (
+    EFFECT_GRADES,
+    ActorSystem,
+    OwnedMessage,
+    evaluate_scope,
+    structural_decompress,
+)
 
 
 def collect_scopes(scope):
@@ -54,3 +60,22 @@ def test_root_grade_matches_max_child(sample_root):
     result = evaluate_scope(sample_root)
     expected_idx = compute_expected_grade(sample_root)
     assert result.grade == EFFECT_GRADES[expected_idx]
+
+
+def test_actor_messages_are_move_only():
+    system = ActorSystem()
+    capability = system.spawn()
+    message = OwnedMessage({"payload": "ping"}, capability, system.next_message_id())
+
+    send_result = capability.send(message)
+    assert send_result.log == [f"send:{capability.actor_id}:msg{message.message_id}"]
+
+    with pytest.raises(RuntimeError):
+        capability.send(message)
+
+
+def test_actor_pipeline_integration():
+    program = structural_decompress("{hjklp}")
+    result = evaluate_scope(program)
+    assert result.grade == "sys"
+    assert any(entry.startswith("actor_0:") for entry in result.log)
