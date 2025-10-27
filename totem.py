@@ -904,6 +904,8 @@ def compute_tir_distance(tir_a, tir_b):
 
     • node_edits — instruction insertions/deletions.
     • grade_delta — cumulative absolute difference across effect grades.
+    • op_changes — opcode substitutions for matching instruction identities.
+    • type_changes — result type substitutions for matching instruction identities.
     • borrow_rewires — argument rewires (kind/target changes).
 
     The total distance is the sum of the components. This yields a coarse yet
@@ -932,6 +934,8 @@ def compute_tir_distance(tir_a, tir_b):
 
     node_edits = 0
     grade_delta = 0
+    op_changes = 0
+    type_changes = 0
     borrow_rewires = 0
 
     all_keys = set(map_a) | set(map_b)
@@ -941,6 +945,12 @@ def compute_tir_distance(tir_a, tir_b):
         if instr_a is None or instr_b is None:
             node_edits += 1
             continue
+
+        if instr_a.op != instr_b.op:
+            op_changes += 1
+
+        if instr_a.typ != instr_b.typ:
+            type_changes += 1
 
         if instr_a.grade != instr_b.grade:
             grade_delta += abs(
@@ -957,10 +967,12 @@ def compute_tir_distance(tir_a, tir_b):
             if item_a != item_b:
                 borrow_rewires += 1
 
-    total = node_edits + grade_delta + borrow_rewires
+    total = node_edits + grade_delta + op_changes + type_changes + borrow_rewires
     return {
         "node_edits": node_edits,
         "grade_delta": grade_delta,
+        "op_changes": op_changes,
+        "type_changes": type_changes,
         "borrow_rewires": borrow_rewires,
         "total": total,
     }

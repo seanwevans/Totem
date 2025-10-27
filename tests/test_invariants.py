@@ -74,6 +74,8 @@ def test_tir_distance_identical_programs():
     assert dist == {
         "node_edits": 0,
         "grade_delta": 0,
+        "op_changes": 0,
+        "type_changes": 0,
         "borrow_rewires": 0,
         "total": 0,
     }
@@ -85,8 +87,10 @@ def test_tir_distance_grade_and_borrow_changes():
     dist = compute_tir_distance(tir_a, tir_b)
     assert dist["node_edits"] == 0
     assert dist["grade_delta"] == 1
+    assert dist["op_changes"] == 1
+    assert dist["type_changes"] == 0
     assert dist["borrow_rewires"] == 1
-    assert dist["total"] == 2
+    assert dist["total"] == 3
 
 
 def test_tir_distance_detects_node_additions():
