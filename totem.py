@@ -31,13 +31,6 @@ import hashlib
 import json
 import sys
 import uuid
-import networkx as nx
-import matplotlib.pyplot as plt
-
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.backends import default_backend
-from cryptography.exceptions import InvalidSignature
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
 
@@ -261,6 +254,9 @@ def _scope_depth(scope):
 
 def visualize_graph(root):
     """Render the decompressed scope graph with color-coded purity and lifetime->borrow edges."""
+    import networkx as nx
+    import matplotlib.pyplot as plt
+
     G = nx.DiGraph()
     lifetime_nodes_added = set()
 
@@ -636,6 +632,10 @@ def show_logbook(limit=10):
 
 def ensure_keypair():
     """Create an RSA keypair if it doesn't exist."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
     try:
         with open(KEY_FILE, "rb") as f:
             private_key = serialization.load_pem_private_key(
@@ -666,6 +666,9 @@ def ensure_keypair():
 
 def sign_hash(sha256_hex):
     """Sign a SHA256 hex digest with the private key."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
     private_key = ensure_keypair()
     signature = private_key.sign(
         sha256_hex.encode(),
@@ -679,6 +682,11 @@ def sign_hash(sha256_hex):
 
 def verify_signature(sha256_hex, signature_hex):
     """Verify a signature against the public key."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import padding
+
     with open(PUB_FILE, "rb") as f:
         public_key = serialization.load_pem_public_key(
             f.read(), backend=default_backend()
