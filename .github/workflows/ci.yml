@@ -34,11 +34,11 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           head_ref: ${{ github.head_ref || github.ref_name }}
           head_repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          commit_message: "chore: apply Ruff formatting"
+          commit_message: "chore: apply Black formatting"
           commands: |
             python -m pip install --upgrade pip
-            pip install ruff
-            ruff format .
+            pip install black
+            black .
 
   tests:
     name: Tests

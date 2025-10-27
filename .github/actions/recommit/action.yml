@@ -1,6 +1,18 @@
 name: "Recommit"
-description: "Commit and push any repository changes"
+description: "Run commands, then commit and push any repository changes"
 inputs:
+  token:
+    description: "Token used to authenticate git pushes"
+    required: false
+  head_ref:
+    description: "Head reference for pull requests"
+    required: false
+  head_repository:
+    description: "Repository that should receive pushes"
+    required: false
+  commands:
+    description: "Commands to execute before committing"
+    required: false
   commit_message:
     description: "Commit message to use when committing changes"
     required: false
@@ -19,15 +31,43 @@ runs:
     - name: Configure git user
       shell: bash
       run: |
+        set -euo pipefail
         git config user.name "${{ inputs.user_name }}"
         git config user.email "${{ inputs.user_email }}"
-    - name: Commit changes if present
+
+    - name: Configure git remote
+      if: ${{ inputs.token != '' }}
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        HEAD_REPOSITORY: ${{ inputs.head_repository }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${TOKEN}"
+        REPOSITORY="${HEAD_REPOSITORY:-$GITHUB_REPOSITORY}"
+        git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPOSITORY}.git"
+
+    - name: Run commands
+      if: ${{ inputs.commands != '' }}
       shell: bash
       run: |
+        set -euo pipefail
+        ${{ inputs.commands }}
+
+    - name: Commit changes if present
+      shell: bash
+      env:
+        HEAD_REF: ${{ inputs.head_ref }}
+      run: |
+        set -euo pipefail
         if [[ -z "$(git status --porcelain)" ]]; then
           echo "No changes to commit."
           exit 0
         fi
         git add -A
         git commit -m "${{ inputs.commit_message }}"
-        git push
+        if [[ -n "${HEAD_REF}" ]]; then
+          git push origin "HEAD:${HEAD_REF}"
+        else
+          git push
+        fi
