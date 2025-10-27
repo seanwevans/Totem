@@ -1,9 +1,5 @@
 # 🪶 Totem — A No-Syntax-Error Programming Language
 
-> Every UTF-8 string is a valid Totem program. The compiler is the decompressor.
-
----
-
 ## 🌐 Overview
 
 **Totem** is a self-contained language and runtime built around a single principle:
