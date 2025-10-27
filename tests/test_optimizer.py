@@ -17,7 +17,14 @@ def test_dead_code_elimination_prunes_unused_pure_ops():
     pure_used = tir.emit("A", "int32", "pure", [], "root", produces="life_a")
     pure_unused = tir.emit("F", "int32", "pure", [], "root", produces="life_unused")
     tir.emit("E", "int32", "pure", [{"target": "life_a"}], "root", produces="life_e")
-    stateful = tir.emit("B", "int32", "state", [], "root", produces="life_state")
+    stateful = tir.emit(
+        "B",
+        "int32",
+        "state",
+        [{"target": "life_a"}],
+        "root",
+        produces="life_state",
+    )
 
     dead_code_elimination(tir)
 
@@ -25,6 +32,34 @@ def test_dead_code_elimination_prunes_unused_pure_ops():
     assert pure_unused not in remaining_ids
     assert pure_used in remaining_ids
     assert stateful in remaining_ids  # effectful instructions are preserved
+
+
+def test_dead_code_elimination_removes_transitive_pure_producers():
+    tir = TIRProgram()
+    pure_root = tir.emit("A", "int32", "pure", [], "root", produces="life_a")
+    pure_mid = tir.emit(
+        "B",
+        "int32",
+        "pure",
+        [{"target": "life_a"}],
+        "root",
+        produces="life_b",
+    )
+    pure_leaf = tir.emit(
+        "C",
+        "int32",
+        "pure",
+        [{"target": "life_b"}],
+        "root",
+        produces="life_c",
+    )
+
+    dead_code_elimination(tir)
+
+    remaining_ids = ids(tir)
+    assert pure_leaf not in remaining_ids
+    assert pure_mid not in remaining_ids
+    assert pure_root not in remaining_ids
 
 
 def test_common_subexpression_elimination_merges_duplicates():

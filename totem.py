@@ -1120,16 +1120,15 @@ def dead_code_elimination(tir):
     """Remove pure instructions whose results are never consumed."""
 
     referenced = set()
-    for instr in tir.instructions:
-        referenced.update(_iter_targets(instr))
-
     kept = []
+
     for instr in reversed(tir.instructions):
-        keep = False
-        if instr.grade != "pure":
-            keep = True
-        if instr.id in referenced or (instr.produces and instr.produces in referenced):
-            keep = True
+        keep = instr.grade != "pure"
+        if not keep:
+            if instr.id in referenced:
+                keep = True
+            elif instr.produces and instr.produces in referenced:
+                keep = True
 
         if keep:
             kept.append(instr)
