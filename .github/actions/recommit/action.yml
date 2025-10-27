@@ -42,7 +42,9 @@ runs:
       run: |
         set -euo pipefail
 
-        git add -A
+        # Stage only modifications to already-tracked files to avoid committing
+        # formatter caches or other artifacts that may be created during the run.
+        git add -u
         if git diff --cached --quiet; then
           echo "No formatting changes detected."
           exit 0
