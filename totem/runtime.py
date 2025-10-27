@@ -47,6 +47,11 @@ except ModuleNotFoundError:  # pragma: no cover
     plt = None
 
 try:
+    from matplotlib import animation as mpl_animation
+except ModuleNotFoundError:  # pragma: no cover
+    mpl_animation = None
+
+try:
     import pydot
 except ModuleNotFoundError:  # pragma: no cover
     pydot = None
@@ -1253,56 +1258,230 @@ def explain_borrow(root_scope, identifier):
     }
 
 
-def visualize_graph(root):  # pragma: no cover
-    """Render the decompressed scope graph with color-coded purity and lifetime->borrow edges."""
+def visualize_graph(root, script="purity"):  # pragma: no cover
+    """Render the decompressed scope graph based on a small visualization DSL.
+
+    The *script* argument accepts one or more comma/semicolon/plus separated
+    directives:
+
+    ``purity``
+        Render the classic purity grade map.
+    ``fence``
+        Render a fence/effect-cap map highlighting scope fences.
+    ``lifetime`` or ``animate:lifetime``
+        Produce a temporal animation that highlights node evaluations and the
+        lifetime borrows they introduce.
+    """
+
     if nx is None or plt is None:
         raise RuntimeError("Visualization requires networkx and matplotlib to be installed")
 
-    G = nx.DiGraph()
-    lifetime_nodes_added = set()
+    if script is True:
+        script = "purity"
+    if script is None:
+        script = "purity"
+    if not isinstance(script, str):
+        raise TypeError("Visualization script must be a string of directives")
+
+    commands = [
+        part.strip().lower()
+        for part in re.split(r"[;,+]+", script)
+        if part.strip()
+    ]
+    if not commands:
+        commands = ["purity"]
+
+    fence_palette = [
+        "#FFE082",
+        "#F8BBD0",
+        "#C5E1A5",
+        "#B39DDB",
+        "#B0BEC5",
+        "#FFAB91",
+        "#80CBC4",
+        "#90CAF9",
+    ]
+
+    graph = nx.DiGraph()
+    lifetime_nodes = {}
+    node_scope = {}
+    node_grade = {}
+    events = []
 
     def add_lifetime_node(life):
         lid = f"L:{life.id}"
-        if lid in lifetime_nodes_added:
-            return lid
-        G.add_node(lid, label=f"L {life.id}", color="#d3d3d3")
-        lifetime_nodes_added.add(lid)
+        if lid not in lifetime_nodes:
+            graph.add_node(
+                lid,
+                label=f"L {life.id}",
+                color="#d3d3d3",
+                kind="lifetime",
+            )
+            lifetime_nodes[lid] = life
         return lid
 
     def walk(scope):
-        for n in scope.nodes:
-            color = GRADE_COLORS.get(getattr(n, "grade", "pure"), "#B0BEC5")
+        for node in scope.nodes:
+            grade = getattr(node, "grade", "pure")
+            color = GRADE_COLORS.get(grade, "#B0BEC5")
+            graph.add_node(
+                node.id,
+                label=f"{node.op}\n[{grade}]",
+                color=color,
+                kind="op",
+                grade=grade,
+            )
+            node_scope[node.id] = scope
+            node_grade[node.id] = grade
 
-            G.add_node(n.id, label=f"{n.op}\n[{n.grade}]", color=color)
+            life_node = add_lifetime_node(node.owned_life)
 
-            for b in n.borrows:
-                lnode = add_lifetime_node(b.target)
-                G.add_edge(lnode, n.id, style="dashed")
+            borrow_edges = []
+            for borrow in node.borrows:
+                life = add_lifetime_node(borrow.target)
+                graph.add_edge(
+                    life,
+                    node.id,
+                    style="dashed",
+                    borrow_kind=borrow.kind,
+                )
+                borrow_edges.append((life, node.id))
+
+            events.append(
+                {
+                    "node": node.id,
+                    "life": life_node,
+                    "edges": borrow_edges,
+                    "description": f"{node.op} [{grade}] @ {_scope_full_path(scope)}",
+                }
+            )
 
         for child in scope.children:
             walk(child)
 
     walk(root)
 
-    node_colors = [G.nodes[n].get("color", "#d3d3d3") for n in G.nodes]
-    node_labels = {n: G.nodes[n].get("label", str(n)) for n in G.nodes}
+    labels = {n: graph.nodes[n].get("label", str(n)) for n in graph.nodes}
+    base_colors = {n: graph.nodes[n].get("color", "#d3d3d3") for n in graph.nodes}
+    positions = nx.spring_layout(graph, seed=42)
+    dashed_edges = [
+        (u, v)
+        for (u, v, data) in graph.edges(data=True)
+        if data.get("style") == "dashed"
+    ]
 
-    pos = nx.spring_layout(G, seed=42)
-    nx.draw(
-        G,
-        pos,
-        with_labels=True,
-        labels=node_labels,
-        node_color=node_colors,
-        edgecolors="black",
-        font_size=8,
-    )
+    def render_static(color_for_node, title):
+        plt.figure()
+        node_colors = [color_for_node(node) for node in graph.nodes]
+        nx.draw(
+            graph,
+            positions,
+            with_labels=True,
+            labels=labels,
+            node_color=node_colors,
+            edgecolors="black",
+            font_size=8,
+        )
+        if dashed_edges:
+            nx.draw_networkx_edges(graph, positions, edgelist=dashed_edges, style="dashed")
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
 
-    dashed = [(u, v) for (u, v, d) in G.edges(data=True) if d.get("style") == "dashed"]
-    nx.draw_networkx_edges(G, pos, edgelist=dashed, style="dashed")
+    fence_cache = {}
 
-    plt.title("Totem Program Graph — purity & lifetimes")
-    plt.show()
+    def fence_color(node):
+        info = graph.nodes[node]
+        if info.get("kind") == "lifetime":
+            return "#d3d3d3"
+        scope = node_scope.get(node)
+        fence = getattr(scope, "fence", None)
+        if fence not in fence_cache:
+            if fence is None:
+                fence_cache[fence] = "#ECEFF1"
+            else:
+                index = len(fence_cache) % len(fence_palette)
+                fence_cache[fence] = fence_palette[index]
+        return fence_cache[fence]
+
+    def purity_color(node):
+        info = graph.nodes[node]
+        if info.get("kind") == "lifetime":
+            return info.get("color", "#d3d3d3")
+        grade = info.get("grade") or node_grade.get(node, "pure")
+        return GRADE_COLORS.get(grade, "#B0BEC5")
+
+    def animate_lifetimes():
+        if mpl_animation is None:
+            raise RuntimeError(
+                "Lifetime animation requires matplotlib's animation module to be available"
+            )
+        if not events:
+            render_static(purity_color, "Purity map (no events to animate)")
+            return
+
+        fig, ax = plt.subplots()
+
+        def draw_frame(index):
+            event = events[index]
+            highlight_nodes = {event["node"], event["life"]}
+            ax.clear()
+            node_colors = []
+            for node in graph.nodes:
+                color = base_colors[node]
+                if node in highlight_nodes:
+                    color = "#FFF176"
+                node_colors.append(color)
+
+            nx.draw(
+                graph,
+                positions,
+                ax=ax,
+                with_labels=True,
+                labels=labels,
+                node_color=node_colors,
+                edgecolors="black",
+                font_size=8,
+            )
+            if dashed_edges:
+                nx.draw_networkx_edges(
+                    graph, positions, ax=ax, edgelist=dashed_edges, style="dashed"
+                )
+            if event["edges"]:
+                nx.draw_networkx_edges(
+                    graph,
+                    positions,
+                    ax=ax,
+                    edgelist=event["edges"],
+                    width=2.5,
+                    edge_color="#E65100",
+                )
+            ax.set_title(
+                "Temporal lifetime animation\n" + event["description"]
+            )
+            ax.margins(0.2)
+            return []
+
+        mpl_animation.FuncAnimation(
+            fig,
+            draw_frame,
+            frames=len(events),
+            interval=1200,
+            repeat=True,
+        )
+        plt.tight_layout()
+        plt.show()
+
+    for command in commands:
+        if command in {"purity", "map:purity", "purity-map"}:
+            render_static(purity_color, "Totem Program Graph — purity map")
+        elif command in {"fence", "map:fence", "fence-map"}:
+            fence_cache.clear()
+            render_static(fence_color, "Totem Program Graph — fence map")
+        elif command in {"lifetime", "animate:lifetime", "lifetime-animation"}:
+            animate_lifetimes()
+        else:
+            raise ValueError(f"Unknown visualization directive '{command}'")
 
 
 def iter_scopes(scope):
@@ -3191,7 +3370,16 @@ def parse_args(args):
     argp.add_argument("--repl", action="store_true", help="Start an interactive REPL")
     argp.add_argument("--src", help="Inline Totem source", default="{a{bc}de{fg}}")
     argp.add_argument("--verify", help="Verify signature for a logbook entry hash")
-    argp.add_argument("--visualize", action="store_true", help="Render program graph")
+    argp.add_argument(
+        "--visualize",
+        nargs="?",
+        const="purity",
+        metavar="SCRIPT",
+        help=(
+            "Render program graph; optionally provide a visualization DSL script "
+            "(e.g. 'purity', 'fence', 'purity+fence', 'animate:lifetime')"
+        ),
+    )
     argp.add_argument(
         "--viz",
         metavar="OUTPUT",
@@ -3352,7 +3540,7 @@ def main(args):  # pragma: no cover
     if params.viz:
         export_graphviz(tree, params.viz)
     if params.visualize:
-        visualize_graph(tree)
+        visualize_graph(tree, params.visualize)
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
