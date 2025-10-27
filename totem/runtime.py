@@ -27,7 +27,7 @@ Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import difflib
 import hashlib
 import heapq
@@ -1787,7 +1787,7 @@ def build_bitcode_document(scope, result_effect):
 
     return {
         "totem_version": "0.5",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "root_scope": scope_to_dict(scope),
         "evaluation": {
             "final_grade": result_effect.grade,
@@ -2009,7 +2009,7 @@ def record_run(bitcode_filename, result_effect):
     sig = sign_hash(sha)
 
     entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "filename": bitcode_filename,
         "hash": sha,
         "signature": sig,
