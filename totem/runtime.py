@@ -1757,6 +1757,143 @@ def build_bitcode_certificates(scope, final_grade):
         )
 
     return {"aliasing": aliasing, "grades": grade}
+
+
+def _ensure_lifetime_registration(scope):
+    """Ensure every node-owned lifetime is registered with its scope."""
+
+    for sc in iter_scopes(scope):
+        seen_ids = {life.id for life in sc.lifetimes}
+        drop_ids = {life.id for life in sc.drops}
+        for node in sc.nodes:
+            life = node.owned_life
+            if life.end_scope is None:
+                life.end_scope = sc
+            if life.id not in seen_ids:
+                sc.lifetimes.append(life)
+                seen_ids.add(life.id)
+            if life.id not in drop_ids:
+                sc.drops.append(life)
+                drop_ids.add(life.id)
+
+
+@dataclass(frozen=True)
+class IncrementalAnalysis:
+    """Result payload returned by :class:`IncrementalVerifier`."""
+
+    source: str
+    tree: "Scope"
+    computed_grade: str
+    aliasing: dict
+    grade_certificate: dict
+
+    @property
+    def ok(self):
+        """Return ``True`` when both aliasing and grade proofs succeed."""
+
+        return bool(self.aliasing.get("ok")) and bool(
+            self.grade_certificate.get("ok")
+        )
+
+    @property
+    def diagnostics(self):
+        """Return a flat list of human-readable diagnostics."""
+
+        messages = []
+        summary = self.aliasing.get("summary", {})
+        alias_errors = summary.get("alias_errors", [])
+        messages.extend(alias_errors)
+
+        if not self.grade_certificate.get("ok", True):
+            details = self.grade_certificate.get("summary", {})
+            expected = details.get("computed_grade")
+            reported = details.get("reported_grade")
+            messages.append(
+                f"Grade mismatch: expected {expected} but analyser reported {reported}"
+            )
+
+        return messages
+
+
+class IncrementalVerifier:
+    """Incrementally analyse Totem source during interactive editing."""
+
+    def __init__(self, source="", ffi_decls=None):
+        self._source = source
+        self._ffi_decls = ffi_decls
+        self._dirty = True
+        self._last_tree = None
+        self._last_result = None
+
+    @property
+    def source(self):
+        """Current buffered source under analysis."""
+
+        return self._source
+
+    def set_source(self, source):
+        """Replace the entire source buffer and re-run analysis."""
+
+        self._source = source
+        self._dirty = True
+        return self.lint()
+
+    def set_ffi_declarations(self, ffi_decls):
+        """Update the FFI declarations used for subsequent analyses."""
+
+        self._ffi_decls = ffi_decls
+        self._dirty = True
+
+    def apply_edit(self, start, end, text):
+        """Apply a text edit defined by ``[start:end]`` → ``text``."""
+
+        length = len(self._source)
+        if start < 0 or end < start or end > length:
+            raise ValueError("Edit bounds are out of range")
+
+        self._source = f"{self._source[:start]}{text}{self._source[end:]}"
+        self._dirty = True
+        return self.lint()
+
+    def lint(self):
+        """Return the most recent analysis, recomputing when necessary."""
+
+        if not self._dirty and self._last_result is not None:
+            return self._last_result
+
+        previous_registry = get_registered_ffi_declarations()
+        if self._ffi_decls is not None:
+            register_ffi_declarations(self._ffi_decls, reset=True)
+
+        try:
+            tree = structural_decompress(self._source)
+            _ensure_lifetime_registration(tree)
+            aliasing = _collect_aliasing_payload(tree)
+            grade_payload = _collect_grade_payload(tree)
+            computed_grade = grade_payload["computed_grade"]
+            grade_certificate = _grade_certificate(tree, computed_grade)
+        finally:
+            if self._ffi_decls is not None:
+                clear_ffi_registry()
+                for name, decl in previous_registry.items():
+                    FFI_REGISTRY[name] = decl
+
+        self._last_tree = tree
+        self._last_result = IncrementalAnalysis(
+            source=self._source,
+            tree=tree,
+            computed_grade=computed_grade,
+            aliasing=aliasing,
+            grade_certificate=grade_certificate,
+        )
+        self._dirty = False
+        return self._last_result
+
+    @property
+    def last_tree(self):
+        """Return the scope tree from the last completed analysis."""
+
+        return self._last_tree
 def _node_to_dict(node):
     entry = {
         "id": node.id,
