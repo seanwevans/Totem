@@ -26,13 +26,31 @@ Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 """
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime
 import difflib
 import hashlib
 import heapq
 import json
+from collections import deque
 from pathlib import Path
+import re
 import sys
+try:
+    import networkx as nx
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    nx = None
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    plt = None
+
+try:
+    import pydot
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pydot = None
+
 try:
     from cryptography.hazmat.primitives.asymmetric import rsa, padding
     from cryptography.hazmat.primitives import hashes, serialization
@@ -59,6 +77,29 @@ OPS = {
     "E": {"grade": "pure"},
     "F": {"grade": "pure"},
     "G": {"grade": "io"},
+    "H": {"grade": "sys"},
+    "J": {"grade": "sys"},
+    "K": {"grade": "pure"},
+    "L": {"grade": "sys"},
+    "P": {"grade": "sys"},
+    "S": {"grade": "sys"},    
+}
+
+IO_IMPORTS = {
+    "C": {
+        "capability": "io.read",
+        "module": "totem_io",
+        "name": "io_read",
+        "params": [],
+        "results": ["i32"],
+    },
+    "G": {
+        "capability": "io.write",
+        "module": "totem_io",
+        "name": "io_write",
+        "params": ["i32"],
+        "results": [],
+    },
 }
 
 PURE_CONST_VALUES = {"A": 1, "D": 2, "F": 5}
@@ -67,6 +108,155 @@ LOGBOOK_FILE = "totem.logbook.jsonl"
 KEY_FILE = "totem_private_key.pem"
 PUB_FILE = "totem_public_key.pem"
 REPL_HISTORY_LIMIT = 10
+
+
+@dataclass
+class FFIDeclaration:
+    """Metadata describing a host-provided foreign function."""
+
+    name: str
+    grade: str
+    arg_types: list
+    return_type: str
+    capabilities: list | None = None
+
+    def __post_init__(self):
+        self.name = (self.name or "").strip().upper()
+        if not self.name:
+            raise ValueError("FFI declaration requires a name")
+        self.grade = (self.grade or "").strip().lower()
+        if self.grade not in EFFECT_GRADES:
+            raise ValueError(
+                f"FFI declaration {self.name} has unknown grade: {self.grade}"
+            )
+        self.arg_types = [a.strip() for a in (self.arg_types or []) if a.strip()]
+        self.return_type = (self.return_type or "").strip() or "void"
+        caps = self.capabilities or []
+        self.capabilities = [c.strip() for c in caps if c.strip()]
+
+    @property
+    def arity(self):
+        return len(self.arg_types)
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "grade": self.grade,
+            "arg_types": list(self.arg_types),
+            "return_type": self.return_type,
+            "capabilities": list(self.capabilities),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict):
+            raise TypeError("FFI declaration must be built from a mapping")
+        name = data.get("name")
+        grade = data.get("grade")
+        arg_types = data.get("arg_types") or data.get("args") or []
+        return_type = data.get("return_type") or data.get("returns")
+        capabilities = (
+            data.get("capabilities")
+            or data.get("requires")
+            or data.get("capability_requirements")
+            or []
+        )
+        return cls(name, grade, arg_types, return_type, capabilities)
+
+
+FFI_REGISTRY = {}
+
+
+INLINE_FFI_PATTERN = re.compile(
+    r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<grade>[a-z]+)\s*"
+    r"\((?P<args>[^)]*)\)\s*->\s*(?P<ret>[^|]+?)\s*"
+    r"(?:\|\s*requires\s*(?P<caps>.+))?$"
+)
+
+
+def parse_inline_ffi(schema):
+    """Parse a simple inline FFI schema into declarations."""
+
+    if not schema:
+        return []
+
+    declarations = []
+    for line in schema.splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        match = INLINE_FFI_PATTERN.match(entry)
+        if not match:
+            raise ValueError(f"Invalid inline FFI declaration: {entry}")
+        args = match.group("args").strip()
+        arg_types = [a.strip() for a in args.split(",") if a.strip()] if args else []
+        caps_text = match.group("caps")
+        caps = []
+        if caps_text:
+            caps = [c.strip() for c in caps_text.split(",") if c.strip()]
+        declarations.append(
+            FFIDeclaration(
+                name=match.group("name"),
+                grade=match.group("grade"),
+                arg_types=arg_types,
+                return_type=match.group("ret").strip(),
+                capabilities=caps,
+            )
+        )
+    return declarations
+
+
+def _normalize_ffi_declarations(spec):
+    """Normalize any supported FFI spec into FFIDeclaration objects."""
+
+    if spec is None:
+        return []
+    if isinstance(spec, FFIDeclaration):
+        return [spec]
+    if isinstance(spec, str):
+        trimmed = spec.strip()
+        if not trimmed:
+            return []
+        if trimmed[0] in "[{":
+            data = json.loads(trimmed)
+            return _normalize_ffi_declarations(data)
+        return parse_inline_ffi(trimmed)
+    if isinstance(spec, dict):
+        # Support either a single declaration dict or a wrapper with "ffi" key.
+        if "declarations" in spec and isinstance(spec["declarations"], list):
+            return _normalize_ffi_declarations(spec["declarations"])
+        if "ffi" in spec and isinstance(spec["ffi"], list):
+            return _normalize_ffi_declarations(spec["ffi"])
+        return [FFIDeclaration.from_dict(spec)]
+    if isinstance(spec, (list, tuple)):
+        decls = []
+        for item in spec:
+            decls.extend(_normalize_ffi_declarations(item))
+        return decls
+    raise TypeError(f"Unsupported FFI spec type: {type(spec)!r}")
+
+
+def register_ffi_declarations(spec, *, reset=False):
+    """Register one or more FFI declarations in the global registry."""
+
+    if reset:
+        FFI_REGISTRY.clear()
+    for decl in _normalize_ffi_declarations(spec):
+        if decl.name in FFI_REGISTRY:
+            raise ValueError(f"Duplicate FFI declaration for {decl.name}")
+        FFI_REGISTRY[decl.name] = decl
+
+
+def clear_ffi_registry():
+    """Remove all registered FFI declarations."""
+
+    FFI_REGISTRY.clear()
+
+
+def get_registered_ffi_declarations():
+    """Return a snapshot of the currently registered declarations."""
+
+    return {name: decl for name, decl in FFI_REGISTRY.items()}
 
 
 def _scope_path(scope):
@@ -82,12 +272,23 @@ def _stable_id(scope_path, index):
     return hashlib.blake2s(token, digest_size=6).hexdigest()
 
 
+def _scope_full_path(scope):
+    """Return a human-readable scope path for display."""
+
+    parts = []
+    while scope is not None:
+        parts.append(scope.name)
+        scope = scope.parent
+    return " > ".join(reversed(parts))
+
+
 class Lifetime:
     def __init__(self, owner_scope, identifier):
         self.id = identifier
         self.owner_scope = owner_scope
         self.end_scope = None
         self.borrows = []
+        self.owner_node = None
 
     def __repr__(self):
         end = self.end_scope.name if self.end_scope else "?"
@@ -104,6 +305,12 @@ class Borrow:
         return f"{self.kind}→{self.target.id}@{self.borrower_scope.name}"
 
 
+def _arity_type_name(arity):
+    """Return the canonical Totem type name for a constructor of a given arity."""
+
+    return f"ADT<{arity}>"
+
+
 class Node:
     def __init__(self, op, typ, scope):
         scope_path = _scope_path(scope)
@@ -115,11 +322,175 @@ class Node:
         life_scope_path = f"{scope_path}.life"
         life_id = _stable_id(life_scope_path, node_index)
         self.owned_life = Lifetime(scope, life_id)
+        self.owned_life.owner_node = self
         self.borrows = []
         self.grade = OPS.get(op, {}).get("grade", "pure")
+        self.ffi = None
+        self.ffi_capabilities = []
+        self._apply_ffi_metadata()
+        self.meta = {}
+        self.arity = 0
+        self.update_type()
 
     def __repr__(self):
         return f"<{self.op}:{self.typ}@{self.scope.name}>"
+
+    def _apply_ffi_metadata(self):
+        decl = FFI_REGISTRY.get(self.op)
+        if not decl:
+            return
+        self.ffi = decl
+        self.grade = decl.grade
+        self.typ = decl.return_type
+        self.ffi_capabilities = list(decl.capabilities)
+    def update_type(self):
+        """Refresh this node's inferred type based on current metadata and borrows."""
+
+        self.arity = len(self.borrows)
+        if "fixed_type" in self.meta:
+            self.typ = self.meta["fixed_type"]
+        elif self.op == "P":
+            self.typ = "match"
+        else:
+            self.typ = _arity_type_name(self.arity)
+        return self.typ
+
+
+class Capability:
+    """Linear capability token tracking resource usage."""
+
+    def __init__(
+        self,
+        kind,
+        resource=None,
+        *,
+        state=None,
+        history=None,
+        generation=0,
+        active=True,
+    ):
+        self.kind = kind
+        self.resource = resource
+        self.state = state or {}
+        self.history = history or []
+        self.generation = generation
+        self._active = active
+
+    def evolve(self, action, detail=None, state_updates=None):
+        if not self._active:
+            raise RuntimeError(f"Capability {self} already consumed")
+
+        new_state = dict(self.state)
+        if state_updates:
+            for key, value in state_updates.items():
+                new_state[key] = value
+
+        new_history = list(self.history)
+        new_history.append({"action": action, "detail": detail})
+
+        self._active = False
+
+        return Capability(
+            self.kind,
+            self.resource,
+            state=new_state,
+            history=new_history,
+            generation=self.generation + 1,
+        )
+
+    @property
+    def is_active(self):
+        return self._active
+
+    def __repr__(self):
+        return f"<Capability {self.kind}@{self.generation}>"
+
+
+@dataclass(frozen=True)
+class CapabilityUseResult:
+    capability: Capability
+    value: object = None
+
+
+def resolve_value(value):
+    if isinstance(value, CapabilityUseResult):
+        return value.value
+    return value
+
+
+def extract_capability(value):
+    if isinstance(value, CapabilityUseResult):
+        return value.capability
+    if isinstance(value, Capability):
+        return value
+    return None
+
+
+def _clone_list(source):
+    return list(source) if source is not None else []
+
+
+def use_file_read(cap):
+    index = cap.state.get("index", 0)
+    contents = cap.state.get("contents", [])
+    if index < len(contents):
+        data = contents[index]
+    else:
+        data = None
+    new_cap = cap.evolve("read", data, {"index": index + 1})
+    return CapabilityUseResult(new_cap, data)
+
+
+def use_file_write(cap, payload):
+    writes = _clone_list(cap.state.get("writes", []))
+    writes.append(payload)
+    new_cap = cap.evolve("write", payload, {"writes": writes})
+    return CapabilityUseResult(new_cap, True)
+
+
+def use_net_send(cap, payload):
+    transmissions = _clone_list(cap.state.get("transmissions", []))
+    transmissions.append(payload)
+    ack = f"sent:{payload}"
+    new_cap = cap.evolve("send", payload, {"transmissions": transmissions})
+    return CapabilityUseResult(new_cap, ack)
+
+
+CAPABILITY_FACTORIES = {
+    "FileRead": lambda: Capability(
+        "FileRead",
+        resource="input",
+        state={"index": 0, "contents": ["input_data"]},
+    ),
+    "FileWrite": lambda: Capability(
+        "FileWrite",
+        resource="output",
+        state={"writes": []},
+    ),
+    "NetSend": lambda: Capability(
+        "NetSend",
+        resource="socket",
+        state={"transmissions": []},
+    ),
+}
+
+
+def create_default_environment():
+    env = {"__capabilities__": {}}
+    for kind, factory in CAPABILITY_FACTORIES.items():
+        env["__capabilities__"][kind] = factory()
+    return env
+
+
+def ensure_capability(env, kind):
+    caps = env.setdefault("__capabilities__", {})
+    if kind not in caps:
+        caps[kind] = CAPABILITY_FACTORIES[kind]()
+    return caps[kind]
+
+
+def store_capability(env, kind, capability):
+    env.setdefault("__capabilities__", {})[kind] = capability
 
 
 class IRNode:
@@ -134,13 +505,15 @@ class IRNode:
 
 
 class Scope:
-    def __init__(self, name, parent=None):
+    def __init__(self, name, parent=None, *, effect_cap=None, fence=None):
         self.name = name
         self.parent = parent
         self.nodes = []
         self.children = []
         self.lifetimes = []
         self.drops = []
+        self.effect_cap = effect_cap
+        self.fence = fence
         if parent:
             parent.children.append(self)
 
@@ -162,10 +535,182 @@ class Effect:
         return Effect(EFFECT_GRADES[new_idx], out.value, self.log + out.log)
 
 
+class MovedValue:
+    """Sentinel stored in the environment when a lifetime has been moved."""
+
+    def __init__(self, origin_id):
+        self.origin_id = origin_id
+
+    def __repr__(self):
+        return f"<moved:{self.origin_id}>"
+
+
+def read_env_value(env, lifetime_id, default=None):
+    """Fetch a lifetime's value while ensuring it has not been moved."""
+
+    if lifetime_id is None:
+        return default
+    if lifetime_id not in env:
+        if default is not None:
+            return default
+        raise KeyError(f"Unknown lifetime {lifetime_id}")
+    val = env[lifetime_id]
+    if isinstance(val, MovedValue):
+        raise RuntimeError(f"Lifetime {lifetime_id} has been moved and is no longer usable")
+    return val
+
+
+def move_env_value(env, lifetime_id):
+    """Mark a lifetime as moved and return its previous value."""
+
+    if lifetime_id is None:
+        raise RuntimeError("Cannot move a value without a lifetime identifier")
+    if lifetime_id not in env:
+        raise KeyError(f"Unknown lifetime {lifetime_id}")
+    val = env[lifetime_id]
+    if isinstance(val, MovedValue):
+        raise RuntimeError(f"Lifetime {lifetime_id} has already been moved")
+    env[lifetime_id] = MovedValue(lifetime_id)
+    return val
+
+
+class OwnedMessage:
+    """A message that must be moved exactly once across actors."""
+
+    def __init__(self, payload, capability, message_id):
+        self.payload = payload
+        self.capability = capability
+        self.message_id = message_id
+        self._moved = False
+
+    def move_payload(self):
+        if self._moved:
+            raise RuntimeError(f"Message {self.message_id} has already been moved")
+        self._moved = True
+        return self.payload
+
+    def __repr__(self):
+        target = getattr(self.capability, "actor_id", "?")
+        return f"<OwnedMessage id={self.message_id}→{target} moved={self._moved}>"
+
+
+class ActorCapability:
+    """Capability used to send messages to a specific actor."""
+
+    def __init__(self, actor_system, actor_id):
+        self.actor_system = actor_system
+        self.actor_id = actor_id
+
+    def send(self, message):
+        return self.actor_system.send(self, message)
+
+    def __repr__(self):
+        return f"<Capability {self.actor_id}>"
+
+
+class Actor:
+    """Single actor with a mailbox and effect-local log."""
+
+    def __init__(self, actor_id, behavior):
+        self.actor_id = actor_id
+        self.behavior = behavior
+        self.mailbox = deque()
+        self.local_log = []
+        self.local_grade_index = EFFECT_GRADES.index("pure")
+
+    def enqueue(self, payload):
+        self.mailbox.append(payload)
+
+    def drain(self):
+        delivered = 0
+        logs = []
+        grade_index = self.local_grade_index
+        while self.mailbox:
+            payload = self.mailbox.popleft()
+            effect = self.behavior(payload)
+            grade_index = max(grade_index, EFFECT_GRADES.index(effect.grade))
+            logs.extend(effect.log)
+            delivered += 1
+        self.local_grade_index = grade_index
+        self.local_log.extend(logs)
+        return delivered, logs, grade_index
+
+
+def default_actor_behavior(payload):
+    return Effect("state", {"last_message": payload}, [f"echo:{payload}"])
+
+
+class ActorSystem:
+    """Ownership-safe actor system with move-only message passing."""
+
+    def __init__(self):
+        self.actors = {}
+        self._actor_counter = 0
+        self._message_counter = 0
+        self._public_log = []
+
+    def spawn(self, behavior=None):
+        behavior = behavior or default_actor_behavior
+        actor_id = f"actor_{self._actor_counter}"
+        self._actor_counter += 1
+        actor = Actor(actor_id, behavior)
+        self.actors[actor_id] = actor
+        return ActorCapability(self, actor_id)
+
+    def next_message_id(self):
+        mid = self._message_counter
+        self._message_counter += 1
+        return mid
+
+    def send(self, capability, message):
+        if message.capability is not capability:
+            raise RuntimeError("Message capability does not match the target actor")
+        payload = message.move_payload()
+        actor = self.actors.get(capability.actor_id)
+        if actor is None:
+            raise RuntimeError(f"Unknown actor {capability.actor_id}")
+        actor.enqueue(payload)
+        log_entry = f"send:{capability.actor_id}:msg{message.message_id}"
+        return Effect("sys", True, [log_entry])
+
+    def run_until_idle(self):
+        delivered = 0
+        logs = []
+        highest_grade = EFFECT_GRADES.index("pure")
+
+        while True:
+            iteration_delivered = 0
+            iteration_logs = []
+            for actor_id, actor in self.actors.items():
+                count, local_logs, grade_idx = actor.drain()
+                if not count and not local_logs:
+                    continue
+                iteration_delivered += count
+                highest_grade = max(highest_grade, grade_idx)
+                iteration_logs.extend(f"{actor_id}:{entry}" for entry in local_logs)
+
+            if not iteration_delivered and not iteration_logs:
+                break
+
+            delivered += iteration_delivered
+            logs.extend(iteration_logs)
+
+        prefix = f"run:delivered={delivered}"
+        if logs:
+            combined = [prefix] + logs
+        else:
+            combined = [prefix]
+        self._public_log = logs
+        return Effect("sys", self, combined)
+
+    @property
+    def last_public_log(self):
+        return list(self._public_log)
+
 class TIRInstruction:
     """Single SSA-like instruction."""
 
-    def __init__(self, id, op, typ, grade, args, scope_path, produces=None):
+    def __init__(self, id, op, typ, grade, args, scope_path, produces=None metadata=None):    
         self.id = id
         self.op = op
         self.typ = typ
@@ -196,6 +741,8 @@ class TIRProgram:
     def __init__(self):
         self.instructions = []
         self.next_id = 0
+        self.constructor_tags = {}
+        self.next_tag = 0
 
     def new_id(self):
         vid = f"v{self.next_id}"
@@ -204,12 +751,331 @@ class TIRProgram:
 
     def emit(self, op, typ, grade, args, scope_path, produces=None):
         vid = self.new_id()
-        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces)
+        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces, metadata)
         self.instructions.append(instr)
         return vid
 
+    def constructor_tag(self, op, arity):
+        key = (op, arity)
+        if key not in self.constructor_tags:
+            self.constructor_tags[key] = self.next_tag
+            self.next_tag += 1
+        return self.constructor_tags[key]
+
+    def desugar_pattern_matches(self):
+        """Lower MATCH instructions into SWITCHes on constructor tags."""
+
+        lowered = []
+        for instr in self.instructions:
+            if instr.op != "MATCH":
+                lowered.append(instr)
+                continue
+
+            cases = instr.metadata.get("cases", [])
+            default = instr.metadata.get("default")
+            switch_meta = {
+                "cases": [
+                    {
+                        "tag": case.get("tag"),
+                        "result": case.get("result"),
+                        "constructor": case.get("constructor"),
+                    }
+                    for case in cases
+                ]
+            }
+            if default is not None:
+                switch_meta["default"] = default
+
+            lowered.append(
+                TIRInstruction(
+                    instr.id,
+                    "SWITCH",
+                    instr.typ,
+                    instr.grade,
+                    instr.args,
+                    instr.scope_path,
+                    switch_meta,
+                )
+            )
+
+        self.instructions = lowered
+        return self
+
     def __repr__(self):
         return "\n".join(map(str, self.instructions))
+
+
+def _mlir_type(typ):
+    """Map Totem types to MLIR types."""
+
+    mapping = {
+        "int32": "i32",
+        "int64": "i64",
+        "float": "f32",
+        "double": "f64",
+    }
+    return mapping.get(typ, "i32")
+
+
+def emit_mlir_module(tir):
+    """Lower a TIR program to a textual MLIR module."""
+
+    lattice = ", ".join(f'"{grade}"' for grade in EFFECT_GRADES)
+    lines = [
+        f"module attributes {{totem.effect_lattice = [{lattice}]}} {{",
+        "  func.func @main() -> () {",
+    ]
+
+    value_map = {}
+
+    for instr in tir.instructions:
+        result_name = instr.id
+        operands = []
+        operand_types = []
+        borrow_kinds = []
+
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                target = arg.get("target")
+                kind = arg.get("kind")
+            else:
+                target = arg
+                kind = None
+
+            if not target:
+                continue
+
+            operand = value_map.get(target, target)
+            operands.append(f"%{operand}")
+            operand_types.append(_mlir_type(instr.typ))
+            if kind:
+                borrow_kinds.append(f'"{kind}"')
+
+        operand_sig = ", ".join(operand_types)
+        if not operand_sig:
+            operand_sig = ""
+        else:
+            operand_sig = f"{operand_sig}"
+
+        attrs = [f'grade = "{instr.grade}"']
+        if borrow_kinds:
+            attrs.append(f"borrow_kinds = [{', '.join(borrow_kinds)}]")
+
+        attr_str = " " + "{" + ", ".join(attrs) + "}" if attrs else ""
+
+        operand_list = ", ".join(operands)
+        line = (
+            f"    %{result_name} = \"totem.{instr.op.lower()}\"({operand_list}) : "
+            f"({operand_sig}) -> {_mlir_type(instr.typ)}{attr_str}"
+        )
+        lines.append(line.rstrip())
+
+        value_map[instr.id] = result_name
+        if instr.produces:
+            value_map[instr.produces] = result_name
+
+    lines.append("    func.return")
+    lines.append("  }")
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+PURE_CONSTANTS = {
+    "A": 1,
+    "D": 2,
+    "F": 5,
+}
+
+
+def emit_llvm_ir(tir):
+    """Emit a simple LLVM IR view for the pure portion of a TIR program."""
+
+    pure_instrs = [instr for instr in tir.instructions if instr.grade == "pure"]
+    if not pure_instrs:
+        return "; Totem program has no pure segment to lower"
+
+    lines = [
+        "; Totem pure segment lowered to LLVM IR",
+        "define void @totem_main() {",
+        "entry:",
+    ]
+
+    value_map = {}
+    declared = set()
+
+    def map_operand(target):
+        return f"%{value_map.get(target, target)}"
+
+    for instr in pure_instrs:
+        result_name = instr.id
+
+        if instr.op in PURE_CONSTANTS:
+            const_val = PURE_CONSTANTS[instr.op]
+            lines.append(f"  %{result_name} = add i32 0, {const_val}")
+        else:
+            operands = []
+            for arg in instr.args:
+                if isinstance(arg, dict):
+                    target = arg.get("target")
+                else:
+                    target = arg
+                if not target:
+                    continue
+                operands.append(map_operand(target))
+
+            operand_parts = [f"i32 {op}" for op in operands]
+            callee = f"@totem_{instr.op.lower()}"
+            declared.add(callee)
+            call_operands = ", ".join(operand_parts)
+            lines.append(
+                f"  %{result_name} = call i32 {callee}({call_operands})"
+                if call_operands
+                else f"  %{result_name} = call i32 {callee}()"
+            )
+
+        value_map[instr.id] = result_name
+        if instr.produces:
+            value_map[instr.produces] = result_name
+
+    lines.append("  ret void")
+    lines.append("}")
+
+    for callee in sorted(declared):
+        lines.append(f"declare i32 {callee}(...)")
+
+    return "\n".join(lines).rstrip()
+class BytecodeInstruction:
+    """Executable instruction in the bytecode VM."""
+
+    __slots__ = ("origin_id", "op", "grade", "args", "produces")
+
+    def __init__(self, origin_id, op, grade, args=None, produces=None):
+        self.origin_id = origin_id
+        self.op = op
+        self.grade = grade
+        self.args = args or []
+        self.produces = produces
+
+
+class BytecodeProgram:
+    """Linear bytecode representation assembled from TIR."""
+
+    def __init__(self, instructions=None):
+        self.instructions = instructions or []
+
+    def append(self, instruction):
+        self.instructions.append(instruction)
+
+
+class BytecodeResult:
+    """Execution artefact from the bytecode VM."""
+
+    def __init__(self, grade, log, stack, env):
+        self.grade = grade
+        self.log = log
+        self.stack = stack
+        self.env = env
+
+
+class BytecodeVM:
+    """A minimal stack-based interpreter for Totem TIR."""
+
+    def __init__(self):
+        self.stack = []
+        self.env = {}
+        self.log = []
+        self._effect_index = 0
+
+    def execute(self, program):
+        for instr in program.instructions:
+            self._step(instr)
+
+        final_grade = EFFECT_GRADES[self._effect_index]
+        return BytecodeResult(final_grade, list(self.log), list(self.stack), dict(self.env))
+
+    # -- internal helpers -------------------------------------------------
+
+    def _step(self, instr):
+        grade_index = self._grade_index(instr.grade)
+        self._effect_index = max(self._effect_index, grade_index)
+
+        value, log_entries = self._apply_operation(instr)
+
+        self.stack.append(value)
+        self.env[instr.origin_id] = value
+        if instr.produces:
+            self.env[instr.produces] = value
+
+        if log_entries:
+            if isinstance(log_entries, (list, tuple)):
+                self.log.extend(log_entries)
+            else:
+                self.log.append(log_entries)
+
+    def _grade_index(self, grade):
+        try:
+            return EFFECT_GRADES.index(grade)
+        except ValueError:
+            return 0
+
+    def _apply_operation(self, instr):
+        op = instr.op
+
+        if op == "A":
+            value = 1
+            return value, [f"A:{value}"]
+        if op == "B":
+            self.env["counter"] = self.env.get("counter", 0) + 1
+            value = self.env["counter"]
+            return value, [f"B:inc->{value}"]
+        if op == "C":
+            value = "input_data"
+            return value, [f"C:read->{value}"]
+        if op == "D":
+            value = 2
+            return value, [f"D:{value}"]
+        if op == "E":
+            base = 0
+            if instr.args:
+                target = instr.args[0][1]
+                base = self.env.get(target, 0)
+            value = base + 3
+            return value, [f"E:{value}"]
+        if op == "F":
+            value = 5
+            return value, [f"F:{value}"]
+        if op == "G":
+            target = instr.args[0][1] if instr.args else None
+            borrowed = self.env.get(target, "?")
+            value = True
+            return value, [f"G:write({borrowed})"]
+
+        # Fallback: produce zero value with a log entry for traceability.
+        value = 0
+        return value, [f"{op}:{value}"]
+
+
+def assemble_bytecode(tir):
+    """Linearise a TIR program into bytecode instructions."""
+
+    program = BytecodeProgram()
+    for instr in tir.instructions:
+        args = []
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                args.append((arg.get("kind"), arg.get("target")))
+            else:
+                args.append((None, arg))
+        program.append(BytecodeInstruction(instr.id, instr.op, instr.grade, args, instr.produces))
+    return program
+
+
+def run_bytecode(program):
+    """Execute a BytecodeProgram and return the resulting effect/log/stack."""
+
+    vm = BytecodeVM()
+    return vm.execute(program)
 
 
 class MetaObject:
@@ -242,22 +1108,66 @@ class MetaObject:
 
 def structural_decompress(src):
     """Build scope tree and typed node graph from raw characters."""
+
+    def combine_caps(parent_cap, new_cap):
+        if parent_cap is None:
+            return new_cap
+        if new_cap is None:
+            return parent_cap
+        parent_idx = EFFECT_GRADES.index(parent_cap)
+        new_idx = EFFECT_GRADES.index(new_cap)
+        return EFFECT_GRADES[min(parent_idx, new_idx)]
+
     root = Scope("root")
-    current = root
+    stack = [(root, None, None)]  # (scope, expected_closer, opener)
     last_node = None
 
+    openers = {
+        "{": {"close": "}", "limit": None, "prefix": "scope", "label": "{}"},
+        "(": {"close": ")", "limit": "pure", "prefix": "pure", "label": "()"},
+        "[": {"close": "]", "limit": "state", "prefix": "state", "label": "[]"},
+        "<": {"close": ">", "limit": "io", "prefix": "io", "label": "<>"},
+    }
+
+    closers = {info["close"]: opener for opener, info in openers.items()}
+
     for ch in src:
-        if ch == "{":
-            s = Scope(f"scope_{len(current.children)}", current)
-            current = s
-        elif ch == "}":
-            for n in current.nodes:
-                n.owned_life.end_scope = current
-                current.lifetimes.append(n.owned_life)
-                current.drops.append(n.owned_life)
-            current = current.parent or current
+        current = stack[-1][0]
+
+        if ch in openers:
+            info = openers[ch]
+            inherited_cap = combine_caps(current.effect_cap, info["limit"])
+            name = f"{info['prefix']}_{len(current.children)}"
+            s = Scope(
+                name,
+                current,
+                effect_cap=inherited_cap,
+                fence=info["label"],
+            )
+            stack.append((s, info["close"], ch))
+        elif ch in closers:
+            if len(stack) == 1:
+                raise ValueError(f"Unmatched closing fence '{ch}'")
+            scope, expected, opener = stack.pop()
+            if ch != expected:
+                raise ValueError(
+                    f"Mismatched fence: opened with '{opener}' but closed with '{ch}'"
+                )
+            for n in scope.nodes:
+                n.owned_life.end_scope = scope
+                scope.lifetimes.append(n.owned_life)
+                scope.drops.append(n.owned_life)
         elif ch.isalpha():
             node = Node(op=ch.upper(), typ="int32", scope=current)
+            cap = current.effect_cap
+            if cap is not None:
+                node_idx = EFFECT_GRADES.index(node.grade)
+                cap_idx = EFFECT_GRADES.index(cap)
+                if node_idx > cap_idx:
+                    fence = current.fence or "scope"
+                    raise ValueError(
+                        f"Effect grade '{node.grade}' exceeds '{cap}' fence in {fence}"
+                    )
             current.nodes.append(node)
 
             if last_node and last_node.scope == current:
@@ -265,7 +1175,12 @@ def structural_decompress(src):
                 b = Borrow(kind, last_node.owned_life, current)
                 node.borrows.append(b)
                 last_node.owned_life.borrows.append(b)
+            node.update_type()
             last_node = node
+
+    if len(stack) != 1:
+        _, expected, opener = stack[-1]
+        raise ValueError(f"Unclosed fence '{opener}' expected '{expected}'")
 
     return root
 
@@ -293,6 +1208,36 @@ def check_lifetimes(scope, errors):
         check_lifetimes(child, errors)
 
 
+def verify_ffi_calls(scope, errors):
+    """Ensure all FFI-backed nodes match their declared metadata."""
+
+    for node in scope.nodes:
+        decl = getattr(node, "ffi", None)
+        if decl:
+            actual_arity = len(node.borrows)
+            if actual_arity != decl.arity:
+                errors.append(
+                    f"FFI {decl.name} arity mismatch: expected {decl.arity}, got {actual_arity}"
+                )
+            for idx, (expected_type, borrow) in enumerate(zip(decl.arg_types, node.borrows)):
+                target_node = getattr(borrow.target, "owner_node", None)
+                actual_type = getattr(target_node, "typ", None)
+                if actual_type and actual_type != expected_type:
+                    errors.append(
+                        f"FFI {decl.name} argument {idx} expects {expected_type} but got {actual_type}"
+                    )
+            if node.typ != decl.return_type:
+                errors.append(
+                    f"FFI {decl.name} return type mismatch: expected {decl.return_type}, got {node.typ}"
+                )
+            if node.grade != decl.grade:
+                errors.append(
+                    f"FFI {decl.name} grade mismatch: expected {decl.grade}, got {node.grade}"
+                )
+    for child in scope.children:
+        verify_ffi_calls(child, errors)
+
+
 def _scope_depth(scope):
     d = 0
     while scope.parent:
@@ -301,15 +1246,182 @@ def _scope_depth(scope):
     return d
 
 
+def compute_scope_grades(scope, grades=None):
+    """Populate a mapping of Scope → grade index."""
+
+    if grades is None:
+        grades = {}
+
+    idx = 0
+    for node in scope.nodes:
+        idx = max(idx, EFFECT_GRADES.index(node.grade))
+    for child in scope.children:
+        child_idx = compute_scope_grades(child, grades)
+        idx = max(idx, child_idx)
+
+    grades[scope] = idx
+    return idx
+
+
+def _collect_grade_cut(scope, target_idx, grades):
+    """Return nodes responsible for lifting this scope to the target grade."""
+
+    contributors = []
+
+    for node in scope.nodes:
+        node_idx = EFFECT_GRADES.index(node.grade)
+        if node_idx >= target_idx:
+            contributors.append(node)
+
+    for child in scope.children:
+        if grades.get(child, -1) >= target_idx:
+            contributors.extend(_collect_grade_cut(child, target_idx, grades))
+
+    return contributors
+
+
+def explain_grade(root_scope, target_grade):
+    """Compute nodes that raise the program to ``target_grade``."""
+
+    grade = target_grade.lower()
+    if grade not in EFFECT_GRADES:
+        raise ValueError(f"Unknown grade '{target_grade}'. Choose from {EFFECT_GRADES}.")
+
+    target_idx = EFFECT_GRADES.index(grade)
+    grades = {}
+    compute_scope_grades(root_scope, grades)
+    root_idx = grades.get(root_scope, 0)
+
+    if root_idx < target_idx:
+        return {
+            "achieved": False,
+            "final_grade": EFFECT_GRADES[root_idx],
+            "nodes": [],
+        }
+
+    contributors = _collect_grade_cut(root_scope, target_idx, grades)
+    seen = set()
+    unique_nodes = []
+    for node in contributors:
+        if node.id in seen:
+            continue
+        seen.add(node.id)
+        unique_nodes.append(node)
+
+    unique_nodes.sort(key=lambda n: (_scope_path(n.scope), n.id))
+
+    return {
+        "achieved": True,
+        "final_grade": EFFECT_GRADES[root_idx],
+        "nodes": unique_nodes,
+    }
+
+
+def _index_lifetimes(root_scope):
+    """Return lookup tables for lifetimes, nodes, and borrow origins."""
+
+    lifetime_by_id = {}
+    owner_node = {}
+    borrow_owners = {}
+
+    for scope in iter_scopes(root_scope):
+        for node in scope.nodes:
+            life = node.owned_life
+            lifetime_by_id[life.id] = life
+            owner_node[life.id] = node
+            for borrow in node.borrows:
+                borrow_owners[borrow] = node
+
+    node_by_id = {node.id: node for node in owner_node.values()}
+
+    return lifetime_by_id, owner_node, node_by_id, borrow_owners
+
+
+def explain_borrow(root_scope, identifier):
+    """Return a nested description of a borrow chain for ``identifier``."""
+
+    lifetime_by_id, owner_node, node_by_id, borrow_owners = _index_lifetimes(
+        root_scope
+    )
+
+    target_life = None
+
+    if identifier in lifetime_by_id:
+        target_life = lifetime_by_id[identifier]
+    elif identifier in node_by_id:
+        target_life = node_by_id[identifier].owned_life
+    else:
+        return {
+            "found": False,
+            "identifier": identifier,
+            "lines": [],
+        }
+
+    def describe_lifetime(life, indent=0, seen=None):
+        if seen is None:
+            seen = set()
+        prefix = "  " * indent
+        lines = []
+
+        scope_line = _scope_full_path(life.owner_scope)
+        end_line = (
+            _scope_full_path(life.end_scope)
+            if life.end_scope is not None
+            else "?"
+        )
+        owner = owner_node.get(life.id)
+        owner_label = (
+            f"node {owner.op} ({owner.id})"
+            if owner is not None
+            else "<unknown node>"
+        )
+        lines.append(
+            f"{prefix}Lifetime {life.id} owned by {owner_label} in {scope_line}, ends at {end_line}"
+        )
+
+        if life.id in seen:
+            lines.append(f"{prefix}  ↺ cycle detected, stopping traversal")
+            return lines
+
+        seen.add(life.id)
+
+        if life.borrows:
+            lines.append(f"{prefix}  Borrows:")
+        for borrow in life.borrows:
+            borrower = borrow_owners.get(borrow)
+            borrower_label = (
+                f"node {borrower.op} ({borrower.id})"
+                if borrower is not None
+                else "<unknown node>"
+            )
+            borrower_scope = _scope_full_path(borrow.borrower_scope)
+            outlives = ""
+            if life.end_scope is not None and _scope_depth(borrow.borrower_scope) > _scope_depth(
+                life.end_scope
+            ):
+                outlives = " (⚠ outlives owner scope)"
+
+            lines.append(
+                f"{prefix}    - {borrow.kind} borrow by {borrower_label} at {borrower_scope}{outlives}"
+            )
+            if borrower is not None:
+                lines.extend(describe_lifetime(borrower.owned_life, indent + 3, seen))
+
+        seen.remove(life.id)
+        return lines
+
+    lines = describe_lifetime(target_life)
+    return {
+        "found": True,
+        "identifier": identifier,
+        "lines": lines,
+    }
+
+
 def visualize_graph(root):
     """Render the decompressed scope graph with color-coded purity and lifetime->borrow edges."""
-    try:
-        import networkx as nx
-        import matplotlib.pyplot as plt
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(
-            "Visualization requires networkx and matplotlib to be installed"
-        ) from exc
+    if nx is None or plt is None:
+        raise RuntimeError("Visualization requires networkx and matplotlib to be installed")
 
     G = nx.DiGraph()
     lifetime_nodes_added = set()
@@ -367,6 +1479,14 @@ def iter_scopes(scope):
 
 def export_graphviz(root, output_path):
     """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
+    import pydot
+
+    if pydot is None:
+        raise RuntimeError("Graphviz export requires the optional pydot dependency")
+
+    import pydot
+
+    import pydot
 
     try:
         import pydot
@@ -477,6 +1597,12 @@ def evaluate_node(node, env):
     def lift(val):
         return Effect(grade, val, [f"{op}:{val}"])
 
+    if node.ffi:
+        log = f"FFI:{node.ffi.name}"
+        if node.ffi_capabilities:
+            log += f" requires {', '.join(node.ffi_capabilities)}"
+        return Effect(node.grade, None, [log])
+
     # Meta-level operations (demo)
     if op == "M":  # reflect current TIR
         tir = build_tir(node.scope)
@@ -499,20 +1625,75 @@ def evaluate_node(node, env):
         env["counter"] = env.get("counter", 0) + 1
         return Effect("state", env["counter"], [f"B:inc->{env['counter']}"])
     elif op == "C":  # IO read (simulated)
-        val = "input_data"
-        return Effect("io", val, [f"C:read->{val}"])
+        borrowed_cap = None
+        if node.borrows:
+            borrowed_cap = extract_capability(env.get(node.borrows[0].target.id))
+        capability = borrowed_cap or ensure_capability(env, "FileRead")
+        result = use_file_read(capability)
+        store_capability(env, "FileRead", result.capability)
+        log_val = result.value if result.value is not None else "EOF"
+        return Effect("io", result, [f"C:read->{log_val}"])
     elif op == "D":
         return lift(2)
     elif op == "E":
         # use borrowed value if available
         src = node.borrows[0].target.id if node.borrows else None
-        val = env.get(src, 0) + 3
+        base = read_env_value(env, src, 0)
+        try:
+            val = base + 3
+        except TypeError:
+            val = 3
         return lift(val)
     elif op == "F":
         return lift(5)
     elif op == "G":  # IO write (simulated)
-        msg = f"G:write({env.get(node.borrows[0].target.id, '?')})"
+        borrow_id = node.borrows[0].target.id if node.borrows else None
+        msg = f"G:write({read_env_value(env, borrow_id, '?')})"
         return Effect("io", True, [msg])
+    elif op == "H":  # create an actor system
+        system = ActorSystem()
+        return Effect("sys", system, ["H:actors"])
+    elif op == "J":  # spawn an actor and return capability
+        if not node.borrows:
+            raise RuntimeError("J requires borrowing an actor system")
+        system = read_env_value(env, node.borrows[0].target.id)
+        if not isinstance(system, ActorSystem):
+            raise RuntimeError("J expects an ActorSystem as input")
+        capability = system.spawn()
+        return Effect("sys", capability, [f"J:spawn({capability.actor_id})"])
+    elif op == "K":  # craft a move-only message for a capability
+        if not node.borrows:
+            raise RuntimeError("K requires borrowing an actor capability")
+        capability = read_env_value(env, node.borrows[0].target.id)
+        if not isinstance(capability, ActorCapability):
+            raise RuntimeError("K expects an ActorCapability as input")
+        message_id = capability.actor_system.next_message_id()
+        payload = {"message": message_id, "to": capability.actor_id}
+        message = OwnedMessage(payload, capability, message_id)
+        return Effect("pure", message, [f"K:msg({capability.actor_id},id={message_id})"])
+    elif op == "L":  # move the message into the actor system
+        if not node.borrows:
+            raise RuntimeError("L requires moving an OwnedMessage")
+        borrow_id = node.borrows[0].target.id
+        message = move_env_value(env, borrow_id)
+        if not isinstance(message, OwnedMessage):
+            raise RuntimeError("L expects an OwnedMessage to send")
+        capability = message.capability
+        send_effect = capability.send(message)
+        logs = [
+            f"L:send({capability.actor_id},id={message.message_id})",
+            *send_effect.log,
+        ]
+        return Effect("sys", capability.actor_system, logs)
+    elif op == "P":  # run all actors until their queues are drained
+        if not node.borrows:
+            raise RuntimeError("P requires borrowing an actor system")
+        system = read_env_value(env, node.borrows[0].target.id)
+        if not isinstance(system, ActorSystem):
+            raise RuntimeError("P expects an ActorSystem as input")
+        run_effect = system.run_until_idle()
+        logs = ["P:run"] + run_effect.log
+        return Effect("sys", system, logs)
     else:
         return lift(0)
 
@@ -522,7 +1703,13 @@ def evaluate_scope(scope, env=None):
     Evaluate a scope: every node returns an Effect.
     The scope's total grade is the max grade of its children.
     """
-    env = env or {}
+    if env is None:
+        env = create_default_environment()
+    else:
+        caps = env.setdefault("__capabilities__", {})
+        for kind, factory in CAPABILITY_FACTORIES.items():
+            if kind not in caps:
+                caps[kind] = factory()
     effects = []
     scope_grade_index = 0
 
@@ -546,6 +1733,8 @@ def scope_to_dict(scope):
     """Recursively convert a Scope tree to a serializable dict."""
     return {
         "name": scope.name,
+        "effect_cap": scope.effect_cap,
+        "fence": scope.fence,
         "lifetimes": [
             {
                 "id": l.id,
@@ -567,8 +1756,10 @@ def scope_to_dict(scope):
                 "id": n.id,
                 "op": n.op,
                 "type": n.typ,
+                "arity": n.arity,
                 "grade": n.grade,
                 "lifetime_id": n.owned_life.id,
+                "meta": n.meta,
                 "borrows": [
                     {
                         "kind": b.kind,
@@ -583,6 +1774,29 @@ def scope_to_dict(scope):
         "drops": [l.id for l in scope.drops],
         "children": [scope_to_dict(child) for child in scope.children],
     }
+
+
+def _node_to_dict(node):
+    entry = {
+        "id": node.id,
+        "op": node.op,
+        "type": node.typ,
+        "grade": node.grade,
+        "lifetime_id": node.owned_life.id,
+        "borrows": [
+            {
+                "kind": b.kind,
+                "target": b.target.id,
+                "borrower_scope": b.borrower_scope.name,
+            }
+            for b in node.borrows
+        ],
+    }
+    if node.ffi:
+        entry["ffi"] = node.ffi.to_dict()
+    if node.ffi_capabilities:
+        entry["ffi_capabilities"] = list(node.ffi_capabilities)
+    return entry
 
 
 def build_bitcode_document(scope, result_effect):
@@ -623,15 +1837,31 @@ def load_totem_bitcode(filename):
 
 def reconstruct_scope(scope_dict, parent=None):
     """Rebuild a full Scope tree (with lifetimes and borrows) from a dictionary."""
-    scope = Scope(scope_dict["name"], parent)
+    scope = Scope(
+        scope_dict["name"],
+        parent,
+        effect_cap=scope_dict.get("effect_cap"),
+        fence=scope_dict.get("fence"),
+    )
 
     # First, create all nodes and lifetimes
     life_map = {}
     for ninfo in scope_dict["nodes"]:
         node = Node(ninfo["op"], ninfo["type"], scope)
         node.grade = ninfo["grade"]
+        node.typ = ninfo["type"]
         node.owned_life.id = ninfo["lifetime_id"]
+        node.meta = ninfo.get("meta", {}) or {}
+        node.arity = ninfo.get("arity", 0)
         life_map[node.owned_life.id] = node.owned_life
+        ffi_info = ninfo.get("ffi")
+        if ffi_info:
+            node.ffi = FFIDeclaration.from_dict(ffi_info)
+            node.ffi_capabilities = list(node.ffi.capabilities)
+            node.grade = node.ffi.grade
+            node.typ = node.ffi.return_type
+        elif ninfo.get("ffi_capabilities"):
+            node.ffi_capabilities = list(ninfo["ffi_capabilities"])
         scope.nodes.append(node)
 
     # Rebuild lifetimes (for visualization/debug)
@@ -649,6 +1879,7 @@ def reconstruct_scope(scope_dict, parent=None):
                 b = Borrow(binfo["kind"], target_life, scope)
                 node.borrows.append(b)
                 target_life.borrows.append(b)
+        node.update_type()
 
     # Drops
     for did in scope_dict.get("drops", []):
@@ -878,7 +2109,7 @@ def build_tir(scope, program=None, prefix="root"):
 
     scope_path = prefix if prefix == "root" else f"{prefix}.{scope.name}"
 
-    for node in scope.nodes:
+    for node in scope.nodes:        
         args = [
             {
                 "kind": "consume" if b.kind == "mut" else "borrow",
@@ -886,19 +2117,229 @@ def build_tir(scope, program=None, prefix="root"):
             }
             for b in node.borrows
         ]
-        program.emit(
-            node.op,
-            node.typ,
-            node.grade,
-            args,
-            scope_path,
-            produces=node.owned_life.id,
-        )
+        # Pattern match nodes are first emitted as MATCH before being desugared.
+        if node.op == "P" and "match_cases" in node.meta:
+            cases_meta = []
+            for ctor in node.meta["match_cases"]:
+                if isinstance(ctor, dict):
+                    ctor_key = tuple(ctor.get("constructor", (ctor.get("op"), ctor.get("arity", 0))))
+                    result = ctor.get("result")
+                else:
+                    ctor_key, result = ctor
+                op_name, arity = ctor_key
+                tag = program.constructor_tag(op_name, arity)
+                cases_meta.append(
+                    {
+                        "constructor": (op_name, arity),
+                        "tag": tag,
+                        "result": result,
+                    }
+                )
+
+            metadata = {"cases": cases_meta}
+            if "default_case" in node.meta:
+                metadata["default"] = node.meta["default_case"]
+
+            program.emit("MATCH", node.typ, node.grade, args, scope_path, metadata)
+            continue
+
+        arity = len(args)
+        constructor_tag = program.constructor_tag(node.op, arity)
+        metadata = {"constructor_tag": constructor_tag, "arity": arity}
+        program.emit(node.op, node.typ, node.grade, args, scope_path, metadata, produces=node.owned_life.id)
 
     for child in scope.children:
         build_tir(child, program, scope_path)
 
+    if prefix == "root":
+        program.desugar_pattern_matches()
+
     return program
+
+
+def _wasm_local_name(identifier):
+    return f"${identifier}"
+
+
+def _format_wasm_list(items, prefix=""):
+    return [f"{prefix}{item}" for item in items]
+
+
+def tir_to_wat(tir, capabilities=None):
+    """Compile a TIRProgram into a WebAssembly text module.
+
+    Only pure instructions are lowered to direct WebAssembly operations. IO-grade
+    instructions are exposed as host imports and require the caller to provide
+    the corresponding capability string (e.g. ``io.read``).
+    """
+
+    capabilities = set(capabilities or [])
+    required_capabilities = []
+
+    local_decls = []
+    local_set = set()
+    body_lines = []
+    last_pure_local = None
+    alias_map = {}
+
+    def declare_local(identifier):
+        lname = _wasm_local_name(identifier)
+        if lname not in local_set:
+            local_decls.append(f"(local {lname} i32)")
+            local_set.add(lname)
+        return lname
+
+    def bind_aliases(instr, local_name):
+        alias_map[instr.id] = local_name
+        if instr.produces:
+            alias_map[instr.produces] = local_name
+
+    imports_needed = {}
+
+    value_producers = {}
+    for instr in tir.instructions:
+        value_producers[instr.id] = instr
+        if instr.produces:
+            value_producers[instr.produces] = instr
+
+    for instr in tir.instructions:
+        if instr.grade == "pure":
+            local_name = declare_local(instr.id)
+            bind_aliases(instr, local_name)
+
+            if instr.op in {"A", "D", "F"}:
+                const_val = {"A": 1, "D": 2, "F": 5}[instr.op]
+                body_lines.append(f"(local.set {local_name} (i32.const {const_val}))")
+            elif instr.op == "CONST" and hasattr(instr, "value"):
+                body_lines.append(
+                    f"(local.set {local_name} (i32.const {int(instr.value)}))"
+                )
+            elif instr.op == "E":
+                if not instr.args:
+                    raise ValueError("E operation expects at least one borrow argument")
+                arg = instr.args[0]
+                target = arg.get("target") if isinstance(arg, dict) else arg
+                dep_local = alias_map.get(target)
+                if not dep_local:
+                    raise ValueError(f"Unknown borrow target {target} for op E")
+                body_lines.append(
+                    f"(local.set {local_name} (i32.add (local.get {dep_local}) (i32.const 3)))"
+                )
+            else:
+                raise NotImplementedError(
+                    f"Pure operation {instr.op} is not supported for WASM lowering"
+                )
+            last_pure_local = local_name
+        elif instr.grade == "io":
+            io_info = IO_IMPORTS.get(instr.op)
+            if not io_info:
+                raise NotImplementedError(
+                    f"IO operation {instr.op} missing import metadata"
+                )
+            cap = io_info["capability"]
+            if cap not in capabilities:
+                raise PermissionError(
+                    f"Capability '{cap}' required to lower IO operation {instr.op}"
+                )
+            required_capabilities.append(cap)
+            import_key = (io_info["module"], io_info["name"])
+            if import_key not in imports_needed:
+                imports_needed[import_key] = io_info
+
+            if instr.produces:
+                local_name = declare_local(instr.id)
+                bind_aliases(instr, local_name)
+            else:
+                local_name = None
+
+            call_operands = []
+            for arg in instr.args:
+                target = arg.get("target") if isinstance(arg, dict) else arg
+                dep_local = alias_map.get(target)
+                if dep_local:
+                    call_operands.append(f"(local.get {dep_local})")
+                else:
+                    producer = value_producers.get(target)
+                    if producer:
+                        raise ValueError(
+                            "IO operation "
+                            f"{instr.op} argument {target} depends on "
+                            f"{producer.op} [{producer.grade}], which cannot be lowered to WebAssembly"
+                        )
+                    elif isinstance(target, str):
+                        raise ValueError(
+                            f"IO operation {instr.op} has unknown dependency {target}"
+                        )
+                    else:
+                        raise ValueError(
+                            f"IO operation {instr.op} received unsupported operand {arg}"
+                        )
+
+            if call_operands:
+                call_expr = (
+                    f"(call ${io_info['name']} " + " ".join(call_operands) + ")"
+                )
+            else:
+                call_expr = f"(call ${io_info['name']})"
+
+            if io_info["results"]:
+                body_lines.append(f"(local.set {local_name} {call_expr})")
+            else:
+                body_lines.append(call_expr)
+                if local_name:
+                    body_lines.append(f"(local.set {local_name} (i32.const 0))")
+        else:
+            # Meta and stateful instructions are not lowered to WebAssembly.
+            continue
+
+    module_lines = ["(module"]
+
+    for (module, name), info in imports_needed.items():
+        params = " ".join(f"(param {p})" for p in info["params"])
+        results = " ".join(f"(result {r})" for r in info["results"])
+        signature = " ".join(filter(None, [params, results]))
+        module_lines.append(
+            f"  (import \"{module}\" \"{name}\" (func ${name} {signature}))"
+        )
+
+    module_lines.append("  (func $run (export \"run\") (result i32)")
+    module_lines.extend(_format_wasm_list(local_decls, prefix="    "))
+    module_lines.extend(_format_wasm_list(body_lines, prefix="    "))
+    if last_pure_local:
+        module_lines.append(f"    (return (local.get {last_pure_local}))")
+    else:
+        module_lines.append("    (return (i32.const 0))")
+    module_lines.append("  )")
+    module_lines.append(")")
+
+    metadata = {
+        "imports": sorted(set(required_capabilities)),
+        "locals": sorted(local_set),
+        "pure_instructions": len([i for i in tir.instructions if i.grade == "pure"]),
+        "io_instructions": len([i for i in tir.instructions if i.grade == "io"]),
+    }
+
+    return "\n".join(module_lines), metadata
+
+
+def export_wasm_module(tir, output_path, capabilities=None, metadata_path=None):
+    """Write a WebAssembly text module to disk."""
+
+    wat, metadata = tir_to_wat(tir, capabilities=capabilities)
+    output_path = Path(output_path)
+    if output_path.parent and not output_path.parent.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(wat, encoding="utf-8")
+    print(f"  ✓ WASM module exported → {output_path}")
+
+    if metadata_path:
+        meta_path = Path(metadata_path)
+        if meta_path.parent and not meta_path.parent.exists():
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        print(f"  ✓ WASM metadata exported → {meta_path}")
+
+    return metadata
 
 
 def reflect(obj):
@@ -970,6 +2411,7 @@ def fold_constants(tir):
                 "pure",
                 [],
                 instr.scope_path,
+                metadata=instr.metadata,
                 produces=instr.produces,
             )
             folded.value = val
@@ -1288,9 +2730,7 @@ def reorder_pure_ops(tir):
                 heapq.heappush(
                     heap,
                     (
-                        grade_rank.get(
-                            succ_instr.grade, len(EFFECT_GRADES)
-                        ),
+                        grade_rank.get(succ_instr.grade, len(EFFECT_GRADES)),
                         original_index[succ],
                         succ,
                     ),
@@ -1378,15 +2818,26 @@ def list_optimizers():
     }
 
 
-def compile_and_evaluate(src):
+def compile_and_evaluate(src, ffi_decls=None):
     """Run the full Totem pipeline on a raw source string."""
 
-    tree = structural_decompress(src)
-    errors = []
-    check_aliasing(tree, errors)
-    check_lifetimes(tree, errors)
-    result = evaluate_scope(tree)
-    return tree, errors, result
+    previous_registry = get_registered_ffi_declarations()
+    if ffi_decls is not None:
+        register_ffi_declarations(ffi_decls, reset=True)
+
+    try:
+        tree = structural_decompress(src)
+        errors = []
+        check_aliasing(tree, errors)
+        check_lifetimes(tree, errors)
+        verify_ffi_calls(tree, errors)
+        result = evaluate_scope(tree)
+        return tree, errors, result
+    finally:
+        if ffi_decls is not None:
+            clear_ffi_registry()
+            for name, decl in previous_registry.items():
+                FFI_REGISTRY[name] = decl
 
 
 def run_repl(history_limit=REPL_HISTORY_LIMIT):
@@ -1431,7 +2882,9 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):
             if cmd in (":quit", ":exit"):
                 break
             if cmd == ":help":
-                print("Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m")
+                print(
+                    "Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m"
+                )
                 print(f"History: last {history_limit} programs cached.")
                 continue
             if cmd == ":viz":
@@ -1544,6 +2997,30 @@ def parse_args(args):
         metavar="OUTPUT",
         help="Export a Graphviz scope visualization to an SVG file",
     )
+    argp.add_argument(
+        "--wasm",
+        metavar="OUTPUT",
+        help="Export the pure TIR as a WebAssembly text module",
+    )
+    argp.add_argument(
+        "--wasm-metadata",
+        metavar="OUTPUT",
+        help="Write lowering metadata alongside the WebAssembly module",
+    )
+    argp.add_argument(
+        "--capability",
+        action="append",
+        dest="capabilities",
+        help="Grant a capability (e.g. io.read) when lowering to WebAssembly",
+        "--why-grade",
+        metavar="GRADE",
+        help="Explain which nodes raised the program to a given effect grade",
+    )
+    argp.add_argument(
+        "--why-borrow",
+        metavar="ID",
+        help="Explain the borrow chain for a lifetime or node identifier",
+    )
 
     return argp.parse_args(args)
 
@@ -1588,11 +3065,68 @@ def main(args):
     for entry in result.log:
         print("   ", entry)
 
+    if params.why_grade:
+        print(f"\nWhy grade '{params.why_grade}':")
+        try:
+            info = explain_grade(tree, params.why_grade)
+        except ValueError as exc:
+            print(f"  ✗ {exc}")
+        else:
+            if not info["achieved"]:
+                print(
+                    "  "
+                    + "Grade not reached. Final grade: "
+                    + info["final_grade"]
+                )
+            elif not info["nodes"]:
+                print("  No nodes with that grade were found.")
+            else:
+                print("  Minimal cut responsible for the requested grade:")
+                for node in info["nodes"]:
+                    scope_path = _scope_full_path(node.scope)
+                    print(
+                        f"    • {node.op} [{node.grade}] id={node.id} @ {scope_path}"
+                    )
+                    if node.borrows:
+                        borrow_desc = ", ".join(
+                            f"{b.kind}->{b.target.id}" for b in node.borrows
+                        )
+                        print(f"        borrows: {borrow_desc}")
+
+    if params.why_borrow:
+        print(f"\nBorrow analysis for '{params.why_borrow}':")
+        info = explain_borrow(tree, params.why_borrow)
+        if not info["found"]:
+            print("  ✗ Identifier not found in this program.")
+        else:
+            for line in info["lines"]:
+                print("  " + line)
+
     export_totem_bitcode(tree, result, "program.totem.json")
     record_run("program.totem.json", result)
     tir = build_tir(tree)
     print("\nTIR:")
     print(tir)
+
+    if params.wasm:
+        try:
+            export_wasm_module(
+                tir,
+                params.wasm,
+                capabilities=params.capabilities,
+                metadata_path=params.wasm_metadata,
+            )
+        except PermissionError as exc:
+            print(f"  ✗ {exc}")
+        except NotImplementedError as exc:
+            print(f"  ✗ {exc}")
+    mlir_module = emit_mlir_module(tir)
+    print("\nMLIR dialect:")
+    print(mlir_module)
+
+    llvm_ir = emit_llvm_ir(tir)
+    print("\nLLVM IR (pure segment):")
+    print(llvm_ir)
 
     if params.viz:
         export_graphviz(tree, params.viz)
