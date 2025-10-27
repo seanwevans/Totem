@@ -33,14 +33,28 @@ import heapq
 import json
 from pathlib import Path
 import sys
-import networkx as nx
-import matplotlib.pyplot as plt
-import pydot
+try:
+    import networkx as nx
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    nx = None
 
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.backends import default_backend
-from cryptography.exceptions import InvalidSignature
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    plt = None
+
+try:
+    import pydot
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pydot = None
+
+try:
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidSignature
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
 
@@ -211,6 +225,139 @@ class TIRProgram:
         return "\n".join(map(str, self.instructions))
 
 
+class BytecodeInstruction:
+    """Executable instruction in the bytecode VM."""
+
+    __slots__ = ("origin_id", "op", "grade", "args", "produces")
+
+    def __init__(self, origin_id, op, grade, args=None, produces=None):
+        self.origin_id = origin_id
+        self.op = op
+        self.grade = grade
+        self.args = args or []
+        self.produces = produces
+
+
+class BytecodeProgram:
+    """Linear bytecode representation assembled from TIR."""
+
+    def __init__(self, instructions=None):
+        self.instructions = instructions or []
+
+    def append(self, instruction):
+        self.instructions.append(instruction)
+
+
+class BytecodeResult:
+    """Execution artefact from the bytecode VM."""
+
+    def __init__(self, grade, log, stack, env):
+        self.grade = grade
+        self.log = log
+        self.stack = stack
+        self.env = env
+
+
+class BytecodeVM:
+    """A minimal stack-based interpreter for Totem TIR."""
+
+    def __init__(self):
+        self.stack = []
+        self.env = {}
+        self.log = []
+        self._effect_index = 0
+
+    def execute(self, program):
+        for instr in program.instructions:
+            self._step(instr)
+
+        final_grade = EFFECT_GRADES[self._effect_index]
+        return BytecodeResult(final_grade, list(self.log), list(self.stack), dict(self.env))
+
+    # -- internal helpers -------------------------------------------------
+
+    def _step(self, instr):
+        grade_index = self._grade_index(instr.grade)
+        self._effect_index = max(self._effect_index, grade_index)
+
+        value, log_entries = self._apply_operation(instr)
+
+        self.stack.append(value)
+        self.env[instr.origin_id] = value
+        if instr.produces:
+            self.env[instr.produces] = value
+
+        if log_entries:
+            if isinstance(log_entries, (list, tuple)):
+                self.log.extend(log_entries)
+            else:
+                self.log.append(log_entries)
+
+    def _grade_index(self, grade):
+        try:
+            return EFFECT_GRADES.index(grade)
+        except ValueError:
+            return 0
+
+    def _apply_operation(self, instr):
+        op = instr.op
+
+        if op == "A":
+            value = 1
+            return value, [f"A:{value}"]
+        if op == "B":
+            self.env["counter"] = self.env.get("counter", 0) + 1
+            value = self.env["counter"]
+            return value, [f"B:inc->{value}"]
+        if op == "C":
+            value = "input_data"
+            return value, [f"C:read->{value}"]
+        if op == "D":
+            value = 2
+            return value, [f"D:{value}"]
+        if op == "E":
+            base = 0
+            if instr.args:
+                target = instr.args[0][1]
+                base = self.env.get(target, 0)
+            value = base + 3
+            return value, [f"E:{value}"]
+        if op == "F":
+            value = 5
+            return value, [f"F:{value}"]
+        if op == "G":
+            target = instr.args[0][1] if instr.args else None
+            borrowed = self.env.get(target, "?")
+            value = True
+            return value, [f"G:write({borrowed})"]
+
+        # Fallback: produce zero value with a log entry for traceability.
+        value = 0
+        return value, [f"{op}:{value}"]
+
+
+def assemble_bytecode(tir):
+    """Linearise a TIR program into bytecode instructions."""
+
+    program = BytecodeProgram()
+    for instr in tir.instructions:
+        args = []
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                args.append((arg.get("kind"), arg.get("target")))
+            else:
+                args.append((None, arg))
+        program.append(BytecodeInstruction(instr.id, instr.op, instr.grade, args, instr.produces))
+    return program
+
+
+def run_bytecode(program):
+    """Execute a BytecodeProgram and return the resulting effect/log/stack."""
+
+    vm = BytecodeVM()
+    return vm.execute(program)
+
+
 class MetaObject:
     """A serializable reflection of a Totem runtime object."""
 
@@ -302,8 +449,8 @@ def _scope_depth(scope):
 
 def visualize_graph(root):
     """Render the decompressed scope graph with color-coded purity and lifetime->borrow edges."""
-    import networkx as nx
-    import matplotlib.pyplot as plt
+    if nx is None or plt is None:
+        raise RuntimeError("Visualization requires networkx and matplotlib to be installed")
 
     G = nx.DiGraph()
     lifetime_nodes_added = set()
@@ -361,6 +508,9 @@ def iter_scopes(scope):
 
 def export_graphviz(root, output_path):
     """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
+
+    if pydot is None:
+        raise RuntimeError("Graphviz export requires the optional pydot dependency")
 
     graph = pydot.Dot(
         "totem_scopes",
@@ -779,9 +929,10 @@ def show_logbook(limit=10):
 
 def ensure_keypair():
     """Create an RSA keypair if it doesn't exist."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    if rsa is None or serialization is None or default_backend is None:
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     try:
         with open(KEY_FILE, "rb") as f:
@@ -813,8 +964,10 @@ def ensure_keypair():
 
 def sign_hash(sha256_hex):
     """Sign a SHA256 hex digest with the private key."""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
+    if hashes is None or padding is None:
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     private_key = ensure_keypair()
     signature = private_key.sign(
@@ -829,10 +982,16 @@ def sign_hash(sha256_hex):
 
 def verify_signature(sha256_hex, signature_hex):
     """Verify a signature against the public key."""
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import padding
+    if (
+        InvalidSignature is None
+        or hashes is None
+        or serialization is None
+        or default_backend is None
+        or padding is None
+    ):
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     with open(PUB_FILE, "rb") as f:
         public_key = serialization.load_pem_public_key(

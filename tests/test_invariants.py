@@ -5,7 +5,14 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from totem import EFFECT_GRADES, evaluate_scope, structural_decompress
+from totem import (
+    EFFECT_GRADES,
+    assemble_bytecode,
+    build_tir,
+    evaluate_scope,
+    run_bytecode,
+    structural_decompress,
+)
 
 
 def collect_scopes(scope):
@@ -54,3 +61,13 @@ def test_root_grade_matches_max_child(sample_root):
     result = evaluate_scope(sample_root)
     expected_idx = compute_expected_grade(sample_root)
     assert result.grade == EFFECT_GRADES[expected_idx]
+
+
+def test_bytecode_vm_matches_scope_evaluation(sample_root):
+    tir = build_tir(sample_root)
+    bytecode = assemble_bytecode(tir)
+    vm_result = run_bytecode(bytecode)
+    scope_result = evaluate_scope(sample_root)
+
+    assert vm_result.grade == scope_result.grade
+    assert vm_result.log == scope_result.log
