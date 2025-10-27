@@ -56,7 +56,7 @@ try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.backends import default_backend
     from cryptography.exceptions import InvalidSignature
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover - optional crypto dependency
     rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
@@ -101,6 +101,8 @@ IO_IMPORTS = {
         "results": [],
     },
 }
+
+PURE_CONST_VALUES = {"A": 1, "D": 2, "F": 5}
 
 LOGBOOK_FILE = "totem.logbook.jsonl"
 KEY_FILE = "totem_private_key.pem"
@@ -1486,6 +1488,11 @@ def export_graphviz(root, output_path):
 
     import pydot
 
+    try:
+        import pydot
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("Graphviz export requires pydot to be installed") from exc
+
     graph = pydot.Dot(
         "totem_scopes",
         graph_type="digraph",
@@ -1606,10 +1613,9 @@ def evaluate_node(node, env):
         return Effect("meta", meta_instr, [f"N:emit({meta_instr})"])
     elif op == "O":  # run optimizer (meta)
         tir = build_tir(node.scope)
-        folded = fold_constants(tir)
-        reorder_pure_ops(folded)
+        optimized = optimize_tir(tir)
         return Effect(
-            "meta", reflect(folded), [f"O:optimize({len(folded.instructions)} instrs)"]
+            "meta", reflect(optimized), [f"O:optimize({len(optimized.instructions)} instrs)"]
         )
 
     # demo semantics
@@ -2016,7 +2022,7 @@ def ensure_keypair():
     """Create an RSA keypair if it doesn't exist."""
     if rsa is None or serialization is None or default_backend is None:
         raise RuntimeError(
-            "Cryptographic operations require the optional 'cryptography' package"
+            "Cryptography support is unavailable; install the 'cryptography' package"
         )
 
     try:
@@ -2049,9 +2055,9 @@ def ensure_keypair():
 
 def sign_hash(sha256_hex):
     """Sign a SHA256 hex digest with the private key."""
-    if hashes is None or padding is None:
+    if rsa is None or hashes is None or padding is None:
         raise RuntimeError(
-            "Cryptographic operations require the optional 'cryptography' package"
+            "Cryptography support is unavailable; install the 'cryptography' package"
         )
 
     private_key = ensure_keypair()
@@ -2075,7 +2081,7 @@ def verify_signature(sha256_hex, signature_hex):
         or padding is None
     ):
         raise RuntimeError(
-            "Cryptographic operations require the optional 'cryptography' package"
+            "Cryptography support is unavailable; install the 'cryptography' package"
         )
 
     with open(PUB_FILE, "rb") as f:
@@ -2376,8 +2382,8 @@ def fold_constants(tir):
     const_map = {}
     new_instrs = []
     for instr in tir.instructions:
-        if instr.op in ("A", "D", "F"):  # treat as constant sources
-            const_map[instr.id] = {"A": 1, "D": 2, "F": 5}[instr.op]
+        if instr.op in PURE_CONST_VALUES:  # treat as constant sources
+            const_map[instr.id] = PURE_CONST_VALUES[instr.op]
             if instr.produces:
                 const_map[instr.produces] = const_map[instr.id]
             new_instrs.append(instr)
@@ -2420,6 +2426,205 @@ def fold_constants(tir):
     return tir
 
 
+def _resolve_alias(replacements, value):
+    if value is None:
+        return None
+    seen = set()
+    current = value
+    while current in replacements and current not in seen:
+        seen.add(current)
+        current = replacements[current]
+    return current
+
+
+def _rewrite_arg(arg, replacements):
+    if isinstance(arg, dict):
+        new_arg = dict(arg)
+        target = new_arg.get("target")
+        if target is not None:
+            new_arg["target"] = _resolve_alias(replacements, target)
+        return new_arg
+    if isinstance(arg, str):
+        return _resolve_alias(replacements, arg)
+    return arg
+
+
+def _freeze_arg(arg):
+    if isinstance(arg, dict):
+        return tuple(sorted((k, _freeze_arg(v)) for k, v in arg.items()))
+    if isinstance(arg, list):
+        return tuple(_freeze_arg(v) for v in arg)
+    return arg
+
+
+def _iter_targets(instr):
+    for arg in instr.args:
+        if isinstance(arg, dict):
+            target = arg.get("target")
+            if target:
+                yield target
+        elif isinstance(arg, str):
+            yield arg
+
+
+def evaluate_pure_regions(tir):
+    """Perform constant/partial evaluation within pure regions."""
+
+    value_map = {}
+    for instr in tir.instructions:
+        known = getattr(instr, "value", None)
+        if known is None and instr.op in PURE_CONST_VALUES:
+            known = PURE_CONST_VALUES[instr.op]
+        if known is not None:
+            value_map[instr.id] = known
+            if instr.produces:
+                value_map[instr.produces] = known
+
+    for instr in tir.instructions:
+        if instr.grade != "pure":
+            # ensure args copied to avoid shared state
+            instr.args = [dict(arg) if isinstance(arg, dict) else arg for arg in instr.args]
+            continue
+
+        constant_values = []
+        dynamic_args = []
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                target = arg.get("target")
+                if target in value_map:
+                    constant_values.append(value_map[target])
+                else:
+                    dynamic_args.append(dict(arg))
+            else:
+                if arg in value_map:
+                    constant_values.append(value_map[arg])
+                else:
+                    dynamic_args.append(arg)
+
+        if not dynamic_args and constant_values:
+            total = sum(constant_values)
+            instr.op = "CONST"
+            instr.args = []
+            instr.value = total
+            value_map[instr.id] = total
+            if instr.produces:
+                value_map[instr.produces] = total
+        else:
+            if constant_values:
+                const_sum = sum(constant_values)
+                instr.partial_constant = const_sum
+                dynamic_args = [
+                    {"kind": "const", "value": const_sum}
+                ] + dynamic_args
+            instr.args = dynamic_args
+
+    return tir
+
+
+def common_subexpression_elimination(tir):
+    """Eliminate redundant pure instructions within the same scope."""
+
+    replacements = {}
+    key_map = {}
+    new_instrs = []
+
+    for instr in tir.instructions:
+        instr.args = [_rewrite_arg(arg, replacements) for arg in instr.args]
+
+        key = None
+        if instr.grade == "pure":
+            key = (
+                instr.scope_path,
+                instr.op,
+                instr.typ,
+                tuple(_freeze_arg(arg) for arg in instr.args),
+                getattr(instr, "value", None),
+                getattr(instr, "partial_constant", None),
+            )
+
+        if key and key in key_map:
+            canonical = key_map[key]
+            replacements[instr.id] = canonical.id
+            if instr.produces and canonical.produces:
+                replacements[instr.produces] = canonical.produces
+            continue
+
+        if key:
+            key_map[key] = instr
+
+        new_instrs.append(instr)
+
+    tir.instructions = new_instrs
+    return tir
+
+
+def dead_code_elimination(tir):
+    """Remove pure instructions whose results are never consumed."""
+
+    referenced = set()
+    kept = []
+
+    for instr in reversed(tir.instructions):
+        keep = instr.grade != "pure"
+        if not keep:
+            if instr.id in referenced:
+                keep = True
+            elif instr.produces and instr.produces in referenced:
+                keep = True
+
+        if keep:
+            kept.append(instr)
+            referenced.add(instr.id)
+            if instr.produces:
+                referenced.add(instr.produces)
+            referenced.update(_iter_targets(instr))
+
+    tir.instructions = list(reversed(kept))
+    return tir
+
+
+def inline_pure_regions(tir):
+    """Inline child scope instructions when the region is purely functional."""
+
+    if not tir.instructions:
+        return tir
+
+    scope_to_instrs = {}
+    value_scopes = {}
+    for instr in tir.instructions:
+        scope_to_instrs.setdefault(instr.scope_path, []).append(instr)
+        value_scopes[instr.id] = instr.scope_path
+        if instr.produces:
+            value_scopes[instr.produces] = instr.scope_path
+
+    for scope_path, instrs in list(scope_to_instrs.items()):
+        if scope_path == "root" or not instrs:
+            continue
+        if not all(instr.grade == "pure" for instr in instrs):
+            continue
+
+        parent = scope_path.rsplit(".", 1)[0] if "." in scope_path else "root"
+
+        can_inline = True
+        for instr in instrs:
+            for target in _iter_targets(instr):
+                dep_scope = value_scopes.get(target)
+                if dep_scope and dep_scope not in {scope_path, parent}:
+                    can_inline = False
+                    break
+            if not can_inline:
+                break
+
+        if not can_inline:
+            continue
+
+        for instr in instrs:
+            instr.scope_path = parent
+            value_scopes[instr.id] = parent
+            if instr.produces:
+                value_scopes[instr.produces] = parent
+
+    return tir
 def reorder_pure_ops(tir):
     """Reorder instructions by effect grade while respecting dependencies."""
 
@@ -2571,6 +2776,12 @@ def reorder_pure_ops(tir):
     return tir
 
 
+def schedule_effects(tir):
+    """Wrapper around the effect-aware scheduler."""
+
+    return reorder_pure_ops(tir)
+
+
 def inline_trivial_io(tir):
     """Replace IO ops with constant placeholders if they have deterministic logs."""
     for instr in tir.instructions:
@@ -2580,11 +2791,30 @@ def inline_trivial_io(tir):
     return tir
 
 
+def optimize_tir(tir):
+    """Run the full suite of optimizer passes."""
+
+    fold_constants(tir)
+    evaluate_pure_regions(tir)
+    common_subexpression_elimination(tir)
+    dead_code_elimination(tir)
+    inline_pure_regions(tir)
+    schedule_effects(tir)
+    inline_trivial_io(tir)
+    return tir
+
+
 def list_optimizers():
     return {
         "fold_constants": "Constant folding for pure ops",
+        "evaluate_pure_regions": "Evaluate pure regions with constants",
+        "common_subexpression_elimination": "Eliminate duplicate pure ops",
+        "dead_code_elimination": "Prune unused pure instructions",
+        "inline_pure_regions": "Inline pure child scopes into parents",
         "reorder_pure_ops": "Effect-sensitive reordering by grade",
+        "schedule_effects": "Effect-aware scheduling respecting dependencies",
         "inline_trivial_io": "Replace deterministic IO reads with constants",
+        "optimize_tir": "Run all optimization passes",
     }
 
 
