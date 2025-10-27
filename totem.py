@@ -301,13 +301,24 @@ class ActorSystem:
         delivered = 0
         logs = []
         highest_grade = EFFECT_GRADES.index("pure")
-        for actor_id, actor in self.actors.items():
-            count, local_logs, grade_idx = actor.drain()
-            if not count and not local_logs:
-                continue
-            delivered += count
-            highest_grade = max(highest_grade, grade_idx)
-            logs.extend(f"{actor_id}:{entry}" for entry in local_logs)
+
+        while True:
+            iteration_delivered = 0
+            iteration_logs = []
+            for actor_id, actor in self.actors.items():
+                count, local_logs, grade_idx = actor.drain()
+                if not count and not local_logs:
+                    continue
+                iteration_delivered += count
+                highest_grade = max(highest_grade, grade_idx)
+                iteration_logs.extend(f"{actor_id}:{entry}" for entry in local_logs)
+
+            if not iteration_delivered and not iteration_logs:
+                break
+
+            delivered += iteration_delivered
+            logs.extend(iteration_logs)
+
         prefix = f"run:delivered={delivered}"
         if logs:
             combined = [prefix] + logs
