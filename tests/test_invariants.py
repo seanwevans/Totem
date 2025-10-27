@@ -11,6 +11,19 @@ from totem import (
     compute_tir_distance,
     continuous_semantics_profile,
     evaluate_scope,
+    ActorSystem,
+    OwnedMessage,
+    evaluate_scope,
+    CapabilityUseResult,
+    create_default_environment,
+    evaluate_scope,
+    Borrow,
+    Node,
+    Scope,    
+    evaluate_scope,
+    assemble_bytecode,    
+    evaluate_scope,
+    run_bytecode,
     structural_decompress,
 )
 
@@ -108,3 +121,123 @@ def test_continuous_semantics_profile_reports_entries():
     for entry in profile:
         assert "distance" in entry
         assert entry["distance"]["total"] >= 0
+def test_actor_messages_are_move_only():
+    system = ActorSystem()
+    capability = system.spawn()
+    message = OwnedMessage({"payload": "ping"}, capability, system.next_message_id())
+
+    send_result = capability.send(message)
+    assert send_result.log == [f"send:{capability.actor_id}:msg{message.message_id}"]
+
+    with pytest.raises(RuntimeError):
+        capability.send(message)
+
+
+def test_actor_pipeline_integration():
+    program = structural_decompress("{hjklp}")
+    result = evaluate_scope(program)
+    assert result.grade == "sys"
+    assert any(entry.startswith("actor_0:") for entry in result.log)
+def test_file_read_capability_linear_progression():
+    env = create_default_environment()
+    initial_cap = env["__capabilities__"]["FileRead"]
+    root = structural_decompress("cc")
+    result = evaluate_scope(root, env)
+
+    read_cap = env["__capabilities__"]["FileRead"]
+    assert read_cap.generation == initial_cap.generation + 2
+    assert len(read_cap.history) == 2
+    assert not initial_cap.is_active
+    assert result.grade == "io"
+
+
+def test_file_write_capability_records_payload():
+    env = create_default_environment()
+    root = structural_decompress("{fg}")
+    evaluate_scope(root, env)
+
+    write_cap = env["__capabilities__"]["FileWrite"]
+    assert write_cap.history[-1]["action"] == "write"
+    assert write_cap.history[-1]["detail"] == 5
+    assert write_cap.state["writes"] == [5]
+
+    g_node = root.children[0].nodes[-1]
+    result_value = env[g_node.owned_life.id]
+    assert isinstance(result_value, CapabilityUseResult)
+    assert result_value.value is True
+
+
+def test_net_send_capability_updates_and_returns_result():
+    env = create_default_environment()
+    root = structural_decompress("as")
+    result = evaluate_scope(root, env)
+
+    assert result.grade == "sys"
+
+    net_cap = env["__capabilities__"]["NetSend"]
+    assert net_cap.history[-1]["action"] == "send"
+    assert net_cap.history[-1]["detail"] == 1
+
+    s_node = root.nodes[-1]
+    stored = env[s_node.owned_life.id]
+    assert isinstance(stored, CapabilityUseResult)
+    assert stored.value == "sent:1"
+def test_inferred_node_types_follow_arity(sample_root):
+    for scope in collect_scopes(sample_root):
+        for node in scope.nodes:
+            assert node.typ == f"ADT<{len(node.borrows)}>"
+            assert node.arity == len(node.borrows)
+
+
+def test_pattern_match_lowers_to_switch():
+    root_scope = Scope("root")
+
+    ctor = Node("A", "int32", root_scope)
+    root_scope.nodes.append(ctor)
+    ctor.update_type()
+
+    match_node = Node("P", "match", root_scope)
+    match_node.meta["match_cases"] = [
+        {"constructor": ("A", ctor.arity), "result": "arm_a"},
+        {"constructor": ("B", 2), "result": "arm_b"},
+    ]
+    match_node.meta["default_case"] = "fallthrough"
+    root_scope.nodes.append(match_node)
+
+    borrow = Borrow("shared", ctor.owned_life, root_scope)
+    match_node.borrows.append(borrow)
+    ctor.owned_life.borrows.append(borrow)
+    match_node.update_type()
+
+    program = build_tir(root_scope)
+    switch_instrs = [instr for instr in program.instructions if instr.op == "SWITCH"]
+    assert switch_instrs, "MATCH should lower to SWITCH"
+
+    switch = switch_instrs[0]
+    assert switch.metadata.get("default") == "fallthrough"
+    constructor_tags = {tuple(case["constructor"]): case["tag"] for case in switch.metadata["cases"]}
+    assert ("A", ctor.arity) in constructor_tags
+    assert switch.args == [ctor.owned_life.id]
+def test_pure_fence_rejects_impure_ops():
+    with pytest.raises(ValueError):
+        structural_decompress("(c)")
+
+
+def test_state_fence_rejects_io_ops():
+    # 'b' (state) is allowed, but 'c' (io) is not.
+    structural_decompress("[ab]")
+    with pytest.raises(ValueError):
+        structural_decompress("[ac]")
+
+
+def test_nested_scope_inherits_parent_cap():
+    with pytest.raises(ValueError):
+        structural_decompress("(a{b})")
+def test_bytecode_vm_matches_scope_evaluation(sample_root):
+    tir = build_tir(sample_root)
+    bytecode = assemble_bytecode(tir)
+    vm_result = run_bytecode(bytecode)
+    scope_result = evaluate_scope(sample_root)
+
+    assert vm_result.grade == scope_result.grade
+    assert vm_result.log == scope_result.log
