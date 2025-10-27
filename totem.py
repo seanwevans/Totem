@@ -74,6 +74,7 @@ OPS = {
     "E": {"grade": "pure"},
     "F": {"grade": "pure"},
     "G": {"grade": "io"},
+    "P": {"grade": "pure"},  # pattern match (pure control flow)
 }
 
 LOGBOOK_FILE = "totem.logbook.jsonl"
@@ -127,6 +128,12 @@ class Borrow:
         return f"{self.kind}→{self.target.id}@{self.borrower_scope.name}"
 
 
+def _arity_type_name(arity):
+    """Return the canonical Totem type name for a constructor of a given arity."""
+
+    return f"ADT<{arity}>"
+
+
 class Node:
     def __init__(self, op, typ, scope):
         scope_path = _scope_path(scope)
@@ -140,9 +147,24 @@ class Node:
         self.owned_life = Lifetime(scope, life_id)
         self.borrows = []
         self.grade = OPS.get(op, {}).get("grade", "pure")
+        self.meta = {}
+        self.arity = 0
+        self.update_type()
 
     def __repr__(self):
         return f"<{self.op}:{self.typ}@{self.scope.name}>"
+
+    def update_type(self):
+        """Refresh this node's inferred type based on current metadata and borrows."""
+
+        self.arity = len(self.borrows)
+        if "fixed_type" in self.meta:
+            self.typ = self.meta["fixed_type"]
+        elif self.op == "P":
+            self.typ = "match"
+        else:
+            self.typ = _arity_type_name(self.arity)
+        return self.typ
 
 
 class IRNode:
@@ -190,7 +212,7 @@ class Effect:
 class TIRInstruction:
     """Single SSA-like instruction."""
 
-    def __init__(self, id, op, typ, grade, args, scope_path, produces=None):
+    def __init__(self, id, op, typ, grade, args, scope_path, produces=None metadata=None):    
         self.id = id
         self.op = op
         self.typ = typ
@@ -221,6 +243,8 @@ class TIRProgram:
     def __init__(self):
         self.instructions = []
         self.next_id = 0
+        self.constructor_tags = {}
+        self.next_tag = 0
 
     def new_id(self):
         vid = f"v{self.next_id}"
@@ -229,9 +253,55 @@ class TIRProgram:
 
     def emit(self, op, typ, grade, args, scope_path, produces=None):
         vid = self.new_id()
-        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces)
+        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces, metadata)
         self.instructions.append(instr)
         return vid
+
+    def constructor_tag(self, op, arity):
+        key = (op, arity)
+        if key not in self.constructor_tags:
+            self.constructor_tags[key] = self.next_tag
+            self.next_tag += 1
+        return self.constructor_tags[key]
+
+    def desugar_pattern_matches(self):
+        """Lower MATCH instructions into SWITCHes on constructor tags."""
+
+        lowered = []
+        for instr in self.instructions:
+            if instr.op != "MATCH":
+                lowered.append(instr)
+                continue
+
+            cases = instr.metadata.get("cases", [])
+            default = instr.metadata.get("default")
+            switch_meta = {
+                "cases": [
+                    {
+                        "tag": case.get("tag"),
+                        "result": case.get("result"),
+                        "constructor": case.get("constructor"),
+                    }
+                    for case in cases
+                ]
+            }
+            if default is not None:
+                switch_meta["default"] = default
+
+            lowered.append(
+                TIRInstruction(
+                    instr.id,
+                    "SWITCH",
+                    instr.typ,
+                    instr.grade,
+                    instr.args,
+                    instr.scope_path,
+                    switch_meta,
+                )
+            )
+
+        self.instructions = lowered
+        return self
 
     def __repr__(self):
         return "\n".join(map(str, self.instructions))
@@ -467,6 +537,7 @@ def structural_decompress(src):
                 b = Borrow(kind, last_node.owned_life, current)
                 node.borrows.append(b)
                 last_node.owned_life.borrows.append(b)
+            node.update_type()
             last_node = node
 
     if len(stack) != 1:
@@ -941,8 +1012,10 @@ def scope_to_dict(scope):
                 "id": n.id,
                 "op": n.op,
                 "type": n.typ,
+                "arity": n.arity,
                 "grade": n.grade,
                 "lifetime_id": n.owned_life.id,
+                "meta": n.meta,
                 "borrows": [
                     {
                         "kind": b.kind,
@@ -1010,6 +1083,8 @@ def reconstruct_scope(scope_dict, parent=None):
         node = Node(ninfo["op"], ninfo["type"], scope)
         node.grade = ninfo["grade"]
         node.owned_life.id = ninfo["lifetime_id"]
+        node.meta = ninfo.get("meta", {}) or {}
+        node.arity = ninfo.get("arity", 0)
         life_map[node.owned_life.id] = node.owned_life
         scope.nodes.append(node)
 
@@ -1028,6 +1103,7 @@ def reconstruct_scope(scope_dict, parent=None):
                 b = Borrow(binfo["kind"], target_life, scope)
                 node.borrows.append(b)
                 target_life.borrows.append(b)
+        node.update_type()
 
     # Drops
     for did in scope_dict.get("drops", []):
@@ -1257,7 +1333,7 @@ def build_tir(scope, program=None, prefix="root"):
 
     scope_path = prefix if prefix == "root" else f"{prefix}.{scope.name}"
 
-    for node in scope.nodes:
+    for node in scope.nodes:        
         args = [
             {
                 "kind": "consume" if b.kind == "mut" else "borrow",
@@ -1265,17 +1341,42 @@ def build_tir(scope, program=None, prefix="root"):
             }
             for b in node.borrows
         ]
-        program.emit(
-            node.op,
-            node.typ,
-            node.grade,
-            args,
-            scope_path,
-            produces=node.owned_life.id,
-        )
+        # Pattern match nodes are first emitted as MATCH before being desugared.
+        if node.op == "P" and "match_cases" in node.meta:
+            cases_meta = []
+            for ctor in node.meta["match_cases"]:
+                if isinstance(ctor, dict):
+                    ctor_key = tuple(ctor.get("constructor", (ctor.get("op"), ctor.get("arity", 0))))
+                    result = ctor.get("result")
+                else:
+                    ctor_key, result = ctor
+                op_name, arity = ctor_key
+                tag = program.constructor_tag(op_name, arity)
+                cases_meta.append(
+                    {
+                        "constructor": (op_name, arity),
+                        "tag": tag,
+                        "result": result,
+                    }
+                )
+
+            metadata = {"cases": cases_meta}
+            if "default_case" in node.meta:
+                metadata["default"] = node.meta["default_case"]
+
+            program.emit("MATCH", node.typ, node.grade, args, scope_path, metadata)
+            continue
+
+        arity = len(args)
+        constructor_tag = program.constructor_tag(node.op, arity)
+        metadata = {"constructor_tag": constructor_tag, "arity": arity}
+        program.emit(node.op, node.typ, node.grade, args, scope_path, metadata, produces=node.owned_life.id)
 
     for child in scope.children:
         build_tir(child, program, scope_path)
+
+    if prefix == "root":
+        program.desugar_pattern_matches()
 
     return program
 
@@ -1349,6 +1450,7 @@ def fold_constants(tir):
                 "pure",
                 [],
                 instr.scope_path,
+                metadata=instr.metadata,
                 produces=instr.produces,
             )
             folded.value = val

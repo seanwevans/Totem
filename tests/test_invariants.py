@@ -7,6 +7,11 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from totem import (
     EFFECT_GRADES,
+    Borrow,
+    Node,
+    Scope,
+    build_tir,
+    evaluate_scope,
     assemble_bytecode,
     build_tir,
     evaluate_scope,
@@ -63,6 +68,42 @@ def test_root_grade_matches_max_child(sample_root):
     assert result.grade == EFFECT_GRADES[expected_idx]
 
 
+def test_inferred_node_types_follow_arity(sample_root):
+    for scope in collect_scopes(sample_root):
+        for node in scope.nodes:
+            assert node.typ == f"ADT<{len(node.borrows)}>"
+            assert node.arity == len(node.borrows)
+
+
+def test_pattern_match_lowers_to_switch():
+    root_scope = Scope("root")
+
+    ctor = Node("A", "int32", root_scope)
+    root_scope.nodes.append(ctor)
+    ctor.update_type()
+
+    match_node = Node("P", "match", root_scope)
+    match_node.meta["match_cases"] = [
+        {"constructor": ("A", ctor.arity), "result": "arm_a"},
+        {"constructor": ("B", 2), "result": "arm_b"},
+    ]
+    match_node.meta["default_case"] = "fallthrough"
+    root_scope.nodes.append(match_node)
+
+    borrow = Borrow("shared", ctor.owned_life, root_scope)
+    match_node.borrows.append(borrow)
+    ctor.owned_life.borrows.append(borrow)
+    match_node.update_type()
+
+    program = build_tir(root_scope)
+    switch_instrs = [instr for instr in program.instructions if instr.op == "SWITCH"]
+    assert switch_instrs, "MATCH should lower to SWITCH"
+
+    switch = switch_instrs[0]
+    assert switch.metadata.get("default") == "fallthrough"
+    constructor_tags = {tuple(case["constructor"]): case["tag"] for case in switch.metadata["cases"]}
+    assert ("A", ctor.arity) in constructor_tags
+    assert switch.args == [ctor.owned_life.id]
 def test_pure_fence_rejects_impure_ops():
     with pytest.raises(ValueError):
         structural_decompress("(c)")
