@@ -5,7 +5,14 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from totem import EFFECT_GRADES, evaluate_scope, structural_decompress
+from totem import (
+    EFFECT_GRADES,
+    build_tir,
+    compute_tir_distance,
+    continuous_semantics_profile,
+    evaluate_scope,
+    structural_decompress,
+)
 
 
 def collect_scopes(scope):
@@ -54,3 +61,46 @@ def test_root_grade_matches_max_child(sample_root):
     result = evaluate_scope(sample_root)
     expected_idx = compute_expected_grade(sample_root)
     assert result.grade == EFFECT_GRADES[expected_idx]
+
+
+def build_tir_from_src(src):
+    return build_tir(structural_decompress(src))
+
+
+def test_tir_distance_identical_programs():
+    tir_a = build_tir_from_src("ab")
+    tir_b = build_tir_from_src("ab")
+    dist = compute_tir_distance(tir_a, tir_b)
+    assert dist == {
+        "node_edits": 0,
+        "grade_delta": 0,
+        "borrow_rewires": 0,
+        "total": 0,
+    }
+
+
+def test_tir_distance_grade_and_borrow_changes():
+    tir_a = build_tir_from_src("ab")
+    tir_b = build_tir_from_src("ac")
+    dist = compute_tir_distance(tir_a, tir_b)
+    assert dist["node_edits"] == 0
+    assert dist["grade_delta"] == 1
+    assert dist["borrow_rewires"] == 1
+    assert dist["total"] == 2
+
+
+def test_tir_distance_detects_node_additions():
+    tir_a = build_tir_from_src("ab")
+    tir_b = build_tir_from_src("abc")
+    dist = compute_tir_distance(tir_a, tir_b)
+    assert dist["node_edits"] == 1
+    assert dist["total"] >= 1
+
+
+def test_continuous_semantics_profile_reports_entries():
+    src = "{ab}"
+    profile = continuous_semantics_profile(src)
+    assert len(profile) == len(src)
+    for entry in profile:
+        assert "distance" in entry
+        assert entry["distance"]["total"] >= 0
