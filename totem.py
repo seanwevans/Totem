@@ -27,12 +27,29 @@ Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 
 import argparse
 from datetime import datetime
+import difflib
 import hashlib
 import json
+from pathlib import Path
 import sys
-import uuid
+import networkx as nx
+import matplotlib.pyplot as plt
+import pydot
+
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
+
+GRADE_COLORS = {
+    "pure": "#8BC34A",
+    "state": "#FFEB3B",
+    "io": "#FF7043",
+    "sys": "#9575CD",
+    "meta": "#B0BEC5",
+}
 
 OPS = {
     "A": {"grade": "pure"},
@@ -47,11 +64,25 @@ OPS = {
 LOGBOOK_FILE = "totem.logbook.jsonl"
 KEY_FILE = "totem_private_key.pem"
 PUB_FILE = "totem_public_key.pem"
+REPL_HISTORY_LIMIT = 10
+
+
+def _scope_path(scope):
+    parts = []
+    while scope is not None:
+        parts.append(scope.name)
+        scope = scope.parent
+    return ".".join(reversed(parts))
+
+
+def _stable_id(scope_path, index):
+    token = f"{scope_path}:{index}".encode("utf-8")
+    return hashlib.blake2s(token, digest_size=6).hexdigest()
 
 
 class Lifetime:
-    def __init__(self, owner_scope):
-        self.id = str(uuid.uuid4())[:6]
+    def __init__(self, owner_scope, identifier):
+        self.id = identifier
         self.owner_scope = owner_scope
         self.end_scope = None
         self.borrows = []
@@ -73,11 +104,15 @@ class Borrow:
 
 class Node:
     def __init__(self, op, typ, scope):
-        self.id = str(uuid.uuid4())[:6]
+        scope_path = _scope_path(scope)
+        node_index = len(scope.nodes)
+        self.id = _stable_id(scope_path, node_index)
         self.op = op
         self.typ = typ
         self.scope = scope
-        self.owned_life = Lifetime(scope)
+        life_scope_path = f"{scope_path}.life"
+        life_id = _stable_id(life_scope_path, node_index)
+        self.owned_life = Lifetime(scope, life_id)
         self.borrows = []
         self.grade = OPS.get(op, {}).get("grade", "pure")
 
@@ -270,13 +305,7 @@ def visualize_graph(root):
 
     def walk(scope):
         for n in scope.nodes:
-            color = {
-                "pure": "green",
-                "state": "yellow",
-                "io": "red",
-                "sys": "purple",
-                "meta": "gray",
-            }.get(getattr(n, "grade", "pure"), "gray")
+            color = GRADE_COLORS.get(getattr(n, "grade", "pure"), "#B0BEC5")
 
             G.add_node(n.id, label=f"{n.op}\n[{n.grade}]", color=color)
 
@@ -308,6 +337,95 @@ def visualize_graph(root):
 
     plt.title("Totem Program Graph — purity & lifetimes")
     plt.show()
+
+
+def iter_scopes(scope):
+    """Yield a scope and all descendants in depth-first order."""
+    yield scope
+    for child in scope.children:
+        yield from iter_scopes(child)
+
+
+def export_graphviz(root, output_path):
+    """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
+
+    graph = pydot.Dot(
+        "totem_scopes",
+        graph_type="digraph",
+        rankdir="LR",
+        splines="spline",
+        fontname="Helvetica",
+    )
+
+    lifetime_nodes = {}
+
+    def build_cluster(scope, path):
+        cluster_name = f"cluster_{path.replace('.', '_')}"
+        cluster = pydot.Cluster(
+            cluster_name,
+            label=path,
+            color="#7f8c8d",
+            fontname="Helvetica",
+            fontsize="10",
+            style="rounded",
+        )
+
+        for node in scope.nodes:
+            color = GRADE_COLORS.get(node.grade, "#B0BEC5")
+            node_label = f"{node.op}\\n[{node.grade}]"
+            graph_node = pydot.Node(
+                node.id,
+                label=node_label,
+                shape="box",
+                style="filled",
+                fillcolor=color,
+                color="#34495e",
+                fontname="Helvetica",
+            )
+            cluster.add_node(graph_node)
+
+            life = node.owned_life
+            lid = f"life_{life.id}"
+            if lid not in lifetime_nodes:
+                lifetime_nodes[lid] = pydot.Node(
+                    lid,
+                    label=f"L {life.id}",
+                    shape="ellipse",
+                    style="dashed",
+                    color="#7f8c8d",
+                    fontname="Helvetica",
+                )
+            cluster.add_node(lifetime_nodes[lid])
+
+        for child in scope.children:
+            child_path = f"{path}.{child.name}"
+            cluster.add_subgraph(build_cluster(child, child_path))
+
+        return cluster
+
+    graph.add_subgraph(build_cluster(root, "root"))
+
+    for scope in iter_scopes(root):
+        for node in scope.nodes:
+            for borrow in node.borrows:
+                src = f"life_{borrow.target.id}"
+                graph.add_edge(
+                    pydot.Edge(
+                        src,
+                        node.id,
+                        style="dashed",
+                        color="#7f8c8d",
+                        penwidth="1.2",
+                        arrowsize="0.8",
+                    )
+                )
+
+    output_path = Path(output_path)
+    if output_path.parent and not output_path.parent.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    graph.write_svg(str(output_path))
+    print(f"  ✓ Graphviz visualization exported → {output_path}")
 
 
 def print_scopes(scope, indent=0):
@@ -444,9 +562,10 @@ def scope_to_dict(scope):
     }
 
 
-def export_totem_bitcode(scope, result_effect, filename="program.totem.json"):
-    """Serialize full program state and evaluation result to JSON."""
-    doc = {
+def build_bitcode_document(scope, result_effect):
+    """Create an in-memory Totem Bitcode representation."""
+
+    return {
         "totem_version": "0.5",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "root_scope": scope_to_dict(scope),
@@ -455,10 +574,21 @@ def export_totem_bitcode(scope, result_effect, filename="program.totem.json"):
             "log": result_effect.log,
         },
     }
+
+
+def write_bitcode_document(doc, filename):
+    """Persist a Totem Bitcode document to disk."""
+
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)
     print(f"  ✓ Totem Bitcode exported → {filename}")
     return doc
+
+
+def export_totem_bitcode(scope, result_effect, filename="program.totem.json"):
+    """Serialize full program state and evaluation result to JSON."""
+    doc = build_bitcode_document(scope, result_effect)
+    return write_bitcode_document(doc, filename)
 
 
 def load_totem_bitcode(filename):
@@ -483,8 +613,7 @@ def reconstruct_scope(scope_dict, parent=None):
 
     # Rebuild lifetimes (for visualization/debug)
     for linfo in scope_dict.get("lifetimes", []):
-        l = Lifetime(scope)
-        l.id = linfo["id"]
+        l = Lifetime(scope, linfo["id"])
         l.owner_scope = scope
         scope.lifetimes.append(l)
         life_map[l.id] = l
@@ -544,12 +673,17 @@ def canonicalize_bitcode(doc):
     return sort_dict(doc)
 
 
+def hash_bitcode_document(doc):
+    """Compute SHA-256 hash of an in-memory Totem Bitcode document."""
+    canon = canonicalize_bitcode(doc)
+    data = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
 def hash_bitcode(filename):
     """Compute SHA-256 hash of a Totem Bitcode file."""
     doc = load_totem_bitcode(filename)
-    canon = canonicalize_bitcode(doc)
-    data = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    h = hashlib.sha256(data).hexdigest()
+    h = hash_bitcode_document(doc)
     print(f"SHA256({filename}) = {h}")
     return h
 
@@ -808,6 +942,149 @@ def list_optimizers():
     }
 
 
+def compile_and_evaluate(src):
+    """Run the full Totem pipeline on a raw source string."""
+
+    tree = structural_decompress(src)
+    errors = []
+    check_aliasing(tree, errors)
+    check_lifetimes(tree, errors)
+    result = evaluate_scope(tree)
+    return tree, errors, result
+
+
+def run_repl(history_limit=REPL_HISTORY_LIMIT):
+    """Interactive Totem shell."""
+
+    print("Totem REPL — enter program bytes or commands (:help for help)")
+    history = []
+    counter = 0
+
+    def resolve_entry(token=None):
+        if not history:
+            print("No cached programs yet.")
+            return None
+        if token is None:
+            return history[-1]
+        try:
+            target = int(token)
+        except ValueError:
+            print("Program index must be an integer.")
+            return None
+        for entry in reversed(history):
+            if entry["index"] == target:
+                return entry
+        print(f"No cached program #{target}.")
+        return None
+
+    while True:
+        try:
+            line = input("totem> ")
+        except EOFError:
+            print()
+            break
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith(":"):
+            parts = stripped.split()
+            cmd = parts[0]
+
+            if cmd in (":quit", ":exit"):
+                break
+            if cmd == ":help":
+                print("Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m")
+                print(f"History: last {history_limit} programs cached.")
+                continue
+            if cmd == ":viz":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if entry:
+                    visualize_graph(entry["tree"])
+                continue
+            if cmd == ":save":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if not entry:
+                    continue
+                if len(parts) > 2:
+                    filename = parts[2]
+                else:
+                    filename = f"program_{entry['index']}.totem.json"
+                write_bitcode_document(entry["bitcode_doc"], filename)
+                continue
+            if cmd == ":hash":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if entry:
+                    h = hash_bitcode_document(entry["bitcode_doc"])
+                    print(f"SHA256(program_{entry['index']}) = {h}")
+                continue
+            if cmd == ":bitcode":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if entry:
+                    canon = canonicalize_bitcode(entry["bitcode_doc"])
+                    print(json.dumps(canon, indent=2))
+                continue
+            if cmd == ":diff":
+                if len(parts) != 3:
+                    print("Usage: :diff <a> <b>")
+                    continue
+                entry_a = resolve_entry(parts[1])
+                entry_b = resolve_entry(parts[2])
+                if not entry_a or not entry_b:
+                    continue
+                canon_a = canonicalize_bitcode(entry_a["bitcode_doc"])
+                canon_b = canonicalize_bitcode(entry_b["bitcode_doc"])
+                text_a = json.dumps(canon_a, indent=2, sort_keys=True).splitlines()
+                text_b = json.dumps(canon_b, indent=2, sort_keys=True).splitlines()
+                diff = list(
+                    difflib.unified_diff(
+                        text_a,
+                        text_b,
+                        fromfile=f"program_{entry_a['index']}",
+                        tofile=f"program_{entry_b['index']}",
+                        lineterm="",
+                    )
+                )
+                if diff:
+                    for line in diff:
+                        print(line)
+                else:
+                    print("Programs are identical.")
+                continue
+
+            print(f"Unknown command: {cmd}")
+            continue
+
+        tree, errors, result = compile_and_evaluate(line)
+        counter += 1
+        entry = {
+            "index": counter,
+            "src": line,
+            "tree": tree,
+            "errors": errors,
+            "result": result,
+            "bitcode_doc": build_bitcode_document(tree, result),
+        }
+        history.append(entry)
+        if len(history) > history_limit:
+            history.pop(0)
+
+        print(f"[#%d] grade: %s" % (entry["index"], result.grade))
+        if errors:
+            print("  analysis:")
+            for e in errors:
+                print("   ", f"✗ {e}")
+        else:
+            print("  analysis: ✓ All lifetime and borrow checks passed")
+        print("  log:")
+        if result.log:
+            for item in result.log:
+                print("   ", item)
+        else:
+            print("    (no log entries)")
+
+
 def parse_args(args):
     argp = argparse.ArgumentParser(description="Totem Language Runtime")
 
@@ -822,9 +1099,15 @@ def parse_args(args):
     argp.add_argument(
         "--logbook", action="store_true", help="Show Totem provenance logbook"
     )
+    argp.add_argument("--repl", action="store_true", help="Start an interactive REPL")
     argp.add_argument("--src", help="Inline Totem source", default="{a{bc}de{fg}}")
     argp.add_argument("--verify", help="Verify signature for a logbook entry hash")
     argp.add_argument("--visualize", action="store_true", help="Render program graph")
+    argp.add_argument(
+        "--viz",
+        metavar="OUTPUT",
+        help="Export a Graphviz scope visualization to an SVG file",
+    )
 
     return argp.parse_args(args)
 
@@ -844,18 +1127,17 @@ def main(args):
     if params.logbook:
         show_logbook()
         return
+    if params.repl:
+        run_repl()
+        return
     if params.verify:
         ok = verify_signature(params.verify, input("Signature hex: ").strip())
         print("✓ Signature valid" if ok else "✗ Invalid signature")
         return
 
     print("Source:", params.src)
-    tree = structural_decompress(params.src)
+    tree, errors, result = compile_and_evaluate(params.src)
     print_scopes(tree)
-
-    errors = []
-    check_aliasing(tree, errors)
-    check_lifetimes(tree, errors)
 
     print("\nCompile-time analysis:")
     if not errors:
@@ -865,7 +1147,6 @@ def main(args):
             print("  ✗", e)
 
     print("\nRuntime evaluation:")
-    result = evaluate_scope(tree)
     print(f"  → final grade: {result.grade}")
     print("  → execution log:")
     for entry in result.log:
@@ -877,6 +1158,8 @@ def main(args):
     print("\nTIR:")
     print(tir)
 
+    if params.viz:
+        export_graphviz(tree, params.viz)
     if params.visualize:
         visualize_graph(tree)
 
