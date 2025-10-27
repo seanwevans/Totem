@@ -12,6 +12,10 @@ from totem import (
     Scope,
     build_tir,
     evaluate_scope,
+    assemble_bytecode,
+    build_tir,
+    evaluate_scope,
+    run_bytecode,
     structural_decompress,
 )
 
@@ -100,3 +104,26 @@ def test_pattern_match_lowers_to_switch():
     constructor_tags = {tuple(case["constructor"]): case["tag"] for case in switch.metadata["cases"]}
     assert ("A", ctor.arity) in constructor_tags
     assert switch.args == [ctor.owned_life.id]
+def test_pure_fence_rejects_impure_ops():
+    with pytest.raises(ValueError):
+        structural_decompress("(c)")
+
+
+def test_state_fence_rejects_io_ops():
+    # 'b' (state) is allowed, but 'c' (io) is not.
+    structural_decompress("[ab]")
+    with pytest.raises(ValueError):
+        structural_decompress("[ac]")
+
+
+def test_nested_scope_inherits_parent_cap():
+    with pytest.raises(ValueError):
+        structural_decompress("(a{b})")
+def test_bytecode_vm_matches_scope_evaluation(sample_root):
+    tir = build_tir(sample_root)
+    bytecode = assemble_bytecode(tir)
+    vm_result = run_bytecode(bytecode)
+    scope_result = evaluate_scope(sample_root)
+
+    assert vm_result.grade == scope_result.grade
+    assert vm_result.log == scope_result.log

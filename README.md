@@ -133,7 +133,7 @@ Totem supports *self-reflective meta-operations* (`Meta` grade):
 | `reflect()` | Returns a `MetaObject` representation of a runtime structure |
 | `meta_emit()` | Dynamically extends the TIR at runtime |
 | `fold_constants()` | Performs constant folding |
-| `reorder_pure_ops()` | Commutes pure ops before impure ops |
+| `reorder_pure_ops()` | Effect-sensitive sort that respects dependencies |
 | `inline_trivial_io()` | Inlines deterministic IO as constants |
 
 ---
