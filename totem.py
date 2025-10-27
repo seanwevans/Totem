@@ -27,6 +27,7 @@ Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 
 import argparse
 from datetime import datetime
+import difflib
 import hashlib
 import json
 from pathlib import Path
@@ -65,6 +66,7 @@ OPS = {
 LOGBOOK_FILE = "totem.logbook.jsonl"
 KEY_FILE = "totem_private_key.pem"
 PUB_FILE = "totem_public_key.pem"
+REPL_HISTORY_LIMIT = 10
 
 
 class Lifetime:
@@ -542,9 +544,10 @@ def scope_to_dict(scope):
     }
 
 
-def export_totem_bitcode(scope, result_effect, filename="program.totem.json"):
-    """Serialize full program state and evaluation result to JSON."""
-    doc = {
+def build_bitcode_document(scope, result_effect):
+    """Create an in-memory Totem Bitcode representation."""
+
+    return {
         "totem_version": "0.5",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "root_scope": scope_to_dict(scope),
@@ -553,10 +556,21 @@ def export_totem_bitcode(scope, result_effect, filename="program.totem.json"):
             "log": result_effect.log,
         },
     }
+
+
+def write_bitcode_document(doc, filename):
+    """Persist a Totem Bitcode document to disk."""
+
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)
     print(f"  ✓ Totem Bitcode exported → {filename}")
     return doc
+
+
+def export_totem_bitcode(scope, result_effect, filename="program.totem.json"):
+    """Serialize full program state and evaluation result to JSON."""
+    doc = build_bitcode_document(scope, result_effect)
+    return write_bitcode_document(doc, filename)
 
 
 def load_totem_bitcode(filename):
@@ -642,12 +656,17 @@ def canonicalize_bitcode(doc):
     return sort_dict(doc)
 
 
+def hash_bitcode_document(doc):
+    """Compute SHA-256 hash of an in-memory Totem Bitcode document."""
+    canon = canonicalize_bitcode(doc)
+    data = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
 def hash_bitcode(filename):
     """Compute SHA-256 hash of a Totem Bitcode file."""
     doc = load_totem_bitcode(filename)
-    canon = canonicalize_bitcode(doc)
-    data = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    h = hashlib.sha256(data).hexdigest()
+    h = hash_bitcode_document(doc)
     print(f"SHA256({filename}) = {h}")
     return h
 
@@ -894,6 +913,149 @@ def list_optimizers():
     }
 
 
+def compile_and_evaluate(src):
+    """Run the full Totem pipeline on a raw source string."""
+
+    tree = structural_decompress(src)
+    errors = []
+    check_aliasing(tree, errors)
+    check_lifetimes(tree, errors)
+    result = evaluate_scope(tree)
+    return tree, errors, result
+
+
+def run_repl(history_limit=REPL_HISTORY_LIMIT):
+    """Interactive Totem shell."""
+
+    print("Totem REPL — enter program bytes or commands (:help for help)")
+    history = []
+    counter = 0
+
+    def resolve_entry(token=None):
+        if not history:
+            print("No cached programs yet.")
+            return None
+        if token is None:
+            return history[-1]
+        try:
+            target = int(token)
+        except ValueError:
+            print("Program index must be an integer.")
+            return None
+        for entry in reversed(history):
+            if entry["index"] == target:
+                return entry
+        print(f"No cached program #{target}.")
+        return None
+
+    while True:
+        try:
+            line = input("totem> ")
+        except EOFError:
+            print()
+            break
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith(":"):
+            parts = stripped.split()
+            cmd = parts[0]
+
+            if cmd in (":quit", ":exit"):
+                break
+            if cmd == ":help":
+                print("Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m")
+                print(f"History: last {history_limit} programs cached.")
+                continue
+            if cmd == ":viz":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if entry:
+                    visualize_graph(entry["tree"])
+                continue
+            if cmd == ":save":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if not entry:
+                    continue
+                if len(parts) > 2:
+                    filename = parts[2]
+                else:
+                    filename = f"program_{entry['index']}.totem.json"
+                write_bitcode_document(entry["bitcode_doc"], filename)
+                continue
+            if cmd == ":hash":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if entry:
+                    h = hash_bitcode_document(entry["bitcode_doc"])
+                    print(f"SHA256(program_{entry['index']}) = {h}")
+                continue
+            if cmd == ":bitcode":
+                entry = resolve_entry(parts[1] if len(parts) > 1 else None)
+                if entry:
+                    canon = canonicalize_bitcode(entry["bitcode_doc"])
+                    print(json.dumps(canon, indent=2))
+                continue
+            if cmd == ":diff":
+                if len(parts) != 3:
+                    print("Usage: :diff <a> <b>")
+                    continue
+                entry_a = resolve_entry(parts[1])
+                entry_b = resolve_entry(parts[2])
+                if not entry_a or not entry_b:
+                    continue
+                canon_a = canonicalize_bitcode(entry_a["bitcode_doc"])
+                canon_b = canonicalize_bitcode(entry_b["bitcode_doc"])
+                text_a = json.dumps(canon_a, indent=2, sort_keys=True).splitlines()
+                text_b = json.dumps(canon_b, indent=2, sort_keys=True).splitlines()
+                diff = list(
+                    difflib.unified_diff(
+                        text_a,
+                        text_b,
+                        fromfile=f"program_{entry_a['index']}",
+                        tofile=f"program_{entry_b['index']}",
+                        lineterm="",
+                    )
+                )
+                if diff:
+                    for line in diff:
+                        print(line)
+                else:
+                    print("Programs are identical.")
+                continue
+
+            print(f"Unknown command: {cmd}")
+            continue
+
+        tree, errors, result = compile_and_evaluate(line)
+        counter += 1
+        entry = {
+            "index": counter,
+            "src": line,
+            "tree": tree,
+            "errors": errors,
+            "result": result,
+            "bitcode_doc": build_bitcode_document(tree, result),
+        }
+        history.append(entry)
+        if len(history) > history_limit:
+            history.pop(0)
+
+        print(f"[#%d] grade: %s" % (entry["index"], result.grade))
+        if errors:
+            print("  analysis:")
+            for e in errors:
+                print("   ", f"✗ {e}")
+        else:
+            print("  analysis: ✓ All lifetime and borrow checks passed")
+        print("  log:")
+        if result.log:
+            for item in result.log:
+                print("   ", item)
+        else:
+            print("    (no log entries)")
+
+
 def parse_args(args):
     argp = argparse.ArgumentParser(description="Totem Language Runtime")
 
@@ -908,6 +1070,7 @@ def parse_args(args):
     argp.add_argument(
         "--logbook", action="store_true", help="Show Totem provenance logbook"
     )
+    argp.add_argument("--repl", action="store_true", help="Start an interactive REPL")
     argp.add_argument("--src", help="Inline Totem source", default="{a{bc}de{fg}}")
     argp.add_argument("--verify", help="Verify signature for a logbook entry hash")
     argp.add_argument("--visualize", action="store_true", help="Render program graph")
@@ -935,18 +1098,17 @@ def main(args):
     if params.logbook:
         show_logbook()
         return
+    if params.repl:
+        run_repl()
+        return
     if params.verify:
         ok = verify_signature(params.verify, input("Signature hex: ").strip())
         print("✓ Signature valid" if ok else "✗ Invalid signature")
         return
 
     print("Source:", params.src)
-    tree = structural_decompress(params.src)
+    tree, errors, result = compile_and_evaluate(params.src)
     print_scopes(tree)
-
-    errors = []
-    check_aliasing(tree, errors)
-    check_lifetimes(tree, errors)
 
     print("\nCompile-time analysis:")
     if not errors:
@@ -956,7 +1118,6 @@ def main(args):
             print("  ✗", e)
 
     print("\nRuntime evaluation:")
-    result = evaluate_scope(tree)
     print(f"  → final grade: {result.grade}")
     print("  → execution log:")
     for entry in result.log:
