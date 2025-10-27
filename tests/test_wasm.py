@@ -21,8 +21,8 @@ def test_tir_to_wat_exports_imports_and_metadata():
     assert wat.startswith("(module")
     assert '(import "totem_io" "io_read"' in wat
     assert '(import "totem_io" "io_write"' in wat
-    assert '(func $run' in wat
-    assert '(return (local.get' in wat
+    assert "(func $run" in wat
+    assert "(return (local.get" in wat
 
     assert metadata["imports"] == ["io.read", "io.write"]
     assert metadata["pure_instructions"] >= 1

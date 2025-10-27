@@ -76,14 +76,16 @@ def test_register_ffi_declarations_supports_various_spec_shapes():
     legacy_dict = {"declarations": [{"name": "Y", "grade": "state", "arg_types": []}]}
     ffi_list_wrapper = {"ffi": [{"name": "Z", "grade": "pure", "arg_types": ["int32"]}]}
     object_decl = FFIDeclaration("W", "sys", ["int32", "bytes"], "void", ["net"])
-    json_blob = json.dumps([
-        {
-            "name": "Q",
-            "grade": "pure",
-            "arg_types": [],
-            "return_type": "void",
-        }
-    ])
+    json_blob = json.dumps(
+        [
+            {
+                "name": "Q",
+                "grade": "pure",
+                "arg_types": [],
+                "return_type": "void",
+            }
+        ]
+    )
 
     register_ffi_declarations(
         [inline_spec, legacy_dict, ffi_list_wrapper, object_decl, json_blob],
@@ -146,10 +148,12 @@ def test_ffi_declaration_validation_errors():
 
 def test_normalize_ffi_handles_various_inputs():
     clear_ffi_registry()
-    json_blob = json.dumps([
-        {"name": "JS", "grade": "pure"},
-        {"name": "JT", "grade": "state"},
-    ])
+    json_blob = json.dumps(
+        [
+            {"name": "JS", "grade": "pure"},
+            {"name": "JT", "grade": "state"},
+        ]
+    )
     register_ffi_declarations(json_blob, reset=True)
     assert "JS" in get_registered_ffi_declarations()
 

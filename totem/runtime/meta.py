@@ -1,4 +1,5 @@
 """Reflection primitives used by the Totem runtime."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -51,7 +52,14 @@ def reflect(obj):
     return MetaObject("Value", obj)
 
 
-def meta_emit(program: TIRProgram, op, typ="int32", grade="pure", args=None, scope_path="root.meta"):
+def meta_emit(
+    program: TIRProgram,
+    op,
+    typ="int32",
+    grade="pure",
+    args=None,
+    scope_path="root.meta",
+):
     """Dynamically extend a TIR program with a new instruction."""
 
     args = args or []

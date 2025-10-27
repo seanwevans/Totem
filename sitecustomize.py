@@ -1,4 +1,5 @@
 """Ensure the repository root is importable when running tests."""
+
 import os
 import sys
 

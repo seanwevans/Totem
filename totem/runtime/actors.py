@@ -1,4 +1,5 @@
 """Actor system primitives for the Totem runtime."""
+
 from __future__ import annotations
 
 from collections import deque
@@ -83,7 +84,9 @@ class ActorSystem:
         self._message_counter = 0
         self._public_log: list[str] = []
 
-    def spawn(self, behavior: Optional[Callable[[OwnedMessage], Effect]] = None) -> ActorCapability:
+    def spawn(
+        self, behavior: Optional[Callable[[OwnedMessage], Effect]] = None
+    ) -> ActorCapability:
         behavior = behavior or default_actor_behavior
         actor_id = f"actor_{self._actor_counter}"
         self._actor_counter += 1

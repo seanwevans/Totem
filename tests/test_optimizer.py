@@ -129,7 +129,9 @@ def test_evaluate_pure_regions_constant_and_partial():
     assert mixed_instr.args[0] == {"kind": "const", "value": 3}
     assert mixed_instr.args[1:] == [{"target": "dynamic"}]
 
-    const_instr = next(instr for instr in tir.instructions if instr.id == only_constants)
+    const_instr = next(
+        instr for instr in tir.instructions if instr.id == only_constants
+    )
     assert const_instr.op == "CONST"
     assert getattr(const_instr, "value", None) == 3
 
@@ -145,7 +147,9 @@ def test_inline_pure_regions_promotes_child_scope():
         "root.scope",
         produces="life_child",
     )
-    child_const = tir.emit("F", "int32", "pure", [], "root.scope", produces="life_const")
+    child_const = tir.emit(
+        "F", "int32", "pure", [], "root.scope", produces="life_const"
+    )
     effect_child = tir.emit(
         "C",
         "int32",
@@ -189,4 +193,3 @@ def test_schedule_effects_orders_by_grade():
     grades = [instr.grade for instr in tir.instructions]
     assert grades.index("state") > grades.index("pure")
     assert grades.index("io") > grades.index("state")
-

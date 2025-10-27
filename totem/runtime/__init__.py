@@ -54,7 +54,30 @@ from .crypto import *
 from .compiler import *
 
 __all__ = []
-for module in (_core, _capabilities, _actors, _tir, _meta, _analysis, _bitcode, _crypto, _compiler):
-    __all__.extend(getattr(module, '__all__', []))
-__all__ += ['main', 'parse_args', 'run_repl', 'parse_inline_ffi', 'FFI_REGISTRY', 'FFIDeclaration', 'clear_ffi_registry', 'get_registered_ffi_declarations', 'register_ffi_declarations', 'KEY_FILE', 'LOGBOOK_FILE', 'PUB_FILE']
+for module in (
+    _core,
+    _capabilities,
+    _actors,
+    _tir,
+    _meta,
+    _analysis,
+    _bitcode,
+    _crypto,
+    _compiler,
+):
+    __all__.extend(getattr(module, "__all__", []))
+__all__ += [
+    "main",
+    "parse_args",
+    "run_repl",
+    "parse_inline_ffi",
+    "FFI_REGISTRY",
+    "FFIDeclaration",
+    "clear_ffi_registry",
+    "get_registered_ffi_declarations",
+    "register_ffi_declarations",
+    "KEY_FILE",
+    "LOGBOOK_FILE",
+    "PUB_FILE",
+]
 __all__ = list(dict.fromkeys(__all__))

@@ -23,9 +23,9 @@ from totem import (
     evaluate_scope,
     Borrow,
     Node,
-    Scope,    
+    Scope,
     evaluate_scope,
-    assemble_bytecode,    
+    assemble_bytecode,
     evaluate_scope,
     run_bytecode,
     structural_decompress,
@@ -117,6 +117,8 @@ def test_certificate_verification_detects_tampering(sample_root):
 
     with pytest.raises(ValueError):
         verify_bitcode_document(doc)
+
+
 def build_tir_from_src(src):
     return build_tir(structural_decompress(src))
 
@@ -162,6 +164,8 @@ def test_continuous_semantics_profile_reports_entries():
     for entry in profile:
         assert "distance" in entry
         assert entry["distance"]["total"] >= 0
+
+
 def test_actor_messages_are_move_only():
     system = ActorSystem()
     capability = system.spawn()
@@ -179,6 +183,8 @@ def test_actor_pipeline_integration():
     result = evaluate_scope(program)
     assert result.grade == "sys"
     assert any(entry.startswith("actor_0:") for entry in result.log)
+
+
 def test_file_read_capability_linear_progression():
     env = create_default_environment()
     initial_cap = env["__capabilities__"]["FileRead"]
@@ -223,6 +229,8 @@ def test_net_send_capability_updates_and_returns_result():
     stored = env[s_node.owned_life.id]
     assert isinstance(stored, CapabilityUseResult)
     assert stored.value == "sent:1"
+
+
 def test_inferred_node_types_follow_arity(sample_root):
     for scope in collect_scopes(sample_root):
         for node in scope.nodes:
@@ -256,9 +264,13 @@ def test_pattern_match_lowers_to_switch():
 
     switch = switch_instrs[0]
     assert switch.metadata.get("default") == "fallthrough"
-    constructor_tags = {tuple(case["constructor"]): case["tag"] for case in switch.metadata["cases"]}
+    constructor_tags = {
+        tuple(case["constructor"]): case["tag"] for case in switch.metadata["cases"]
+    }
     assert ("A", ctor.arity) in constructor_tags
     assert switch.args == [ctor.owned_life.id]
+
+
 def test_pure_fence_rejects_impure_ops():
     with pytest.raises(ValueError):
         structural_decompress("(c)")
@@ -274,6 +286,8 @@ def test_state_fence_rejects_io_ops():
 def test_nested_scope_inherits_parent_cap():
     with pytest.raises(ValueError):
         structural_decompress("(a{b})")
+
+
 def test_bytecode_vm_matches_scope_evaluation(sample_root):
     tir = build_tir(sample_root)
     bytecode = assemble_bytecode(tir)

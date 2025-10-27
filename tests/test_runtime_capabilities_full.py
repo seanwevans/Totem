@@ -19,7 +19,9 @@ from totem.runtime.capabilities import (
 
 
 def test_capability_evolve_updates_state_and_history():
-    cap = Capability("Test", state={"count": 0}, history=[{"action": "start", "detail": None}])
+    cap = Capability(
+        "Test", state={"count": 0}, history=[{"action": "start", "detail": None}]
+    )
 
     new_cap = cap.evolve("tick", detail=1, state_updates={"count": 1})
 

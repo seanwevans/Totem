@@ -1,4 +1,5 @@
 """Ensure tests can import the project root as a package."""
+
 import os
 import sys
 

@@ -1,4 +1,5 @@
 """Compilation and optimization pipeline for Totem."""
+
 from __future__ import annotations
 
 import heapq
@@ -24,6 +25,7 @@ from .analysis import (
 from .core import Scope
 from .tir import TIRInstruction, TIRProgram, TranspilationResult
 
+
 def build_tir(scope, program=None, prefix="root", include_attached=False):
     """Lower a full scope tree into a flat TIRProgram."""
     if program is None:
@@ -31,7 +33,7 @@ def build_tir(scope, program=None, prefix="root", include_attached=False):
 
     scope_path = prefix if prefix == "root" else f"{prefix}.{scope.name}"
 
-    for node in scope.nodes:        
+    for node in scope.nodes:
         args = [
             {
                 "kind": "consume" if b.kind == "mut" else "borrow",
@@ -44,7 +46,9 @@ def build_tir(scope, program=None, prefix="root", include_attached=False):
             cases_meta = []
             for ctor in node.meta["match_cases"]:
                 if isinstance(ctor, dict):
-                    ctor_key = tuple(ctor.get("constructor", (ctor.get("op"), ctor.get("arity", 0))))
+                    ctor_key = tuple(
+                        ctor.get("constructor", (ctor.get("op"), ctor.get("arity", 0)))
+                    )
                     result = ctor.get("result")
                 else:
                     ctor_key, result = ctor
@@ -169,8 +173,7 @@ def compute_tir_distance(tir_a, tir_b):
 
         if instr_a.grade != instr_b.grade:
             grade_delta += abs(
-                EFFECT_GRADES.index(instr_a.grade)
-                - EFFECT_GRADES.index(instr_b.grade)
+                EFFECT_GRADES.index(instr_a.grade) - EFFECT_GRADES.index(instr_b.grade)
             )
 
         args_a = _normalize_args(instr_a.args)
@@ -253,6 +256,8 @@ def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
         )
 
     return profile
+
+
 def _wasm_local_name(identifier):
     return f"${identifier}"
 
@@ -373,9 +378,7 @@ def tir_to_wat(tir, capabilities=None):
                     # The IO import does not expect arguments; ignore the dependency.
 
             if call_operands:
-                call_expr = (
-                    f"(call ${io_info['name']} " + " ".join(call_operands) + ")"
-                )
+                call_expr = f"(call ${io_info['name']} " + " ".join(call_operands) + ")"
             else:
                 call_expr = f"(call ${io_info['name']})"
 
@@ -396,10 +399,10 @@ def tir_to_wat(tir, capabilities=None):
         results = " ".join(f"(result {r})" for r in info["results"])
         signature = " ".join(filter(None, [params, results]))
         module_lines.append(
-            f"  (import \"{module}\" \"{name}\" (func ${name} {signature}))"
+            f'  (import "{module}" "{name}" (func ${name} {signature}))'
         )
 
-    module_lines.append("  (func $run (export \"run\") (result i32)")
+    module_lines.append('  (func $run (export "run") (result i32)')
     module_lines.extend(_format_wasm_list(local_decls, prefix="    "))
     module_lines.extend(_format_wasm_list(body_lines, prefix="    "))
     if last_pure_local:
@@ -545,7 +548,9 @@ def evaluate_pure_regions(tir):
     for instr in tir.instructions:
         if instr.grade != "pure":
             # ensure args copied to avoid shared state
-            instr.args = [dict(arg) if isinstance(arg, dict) else arg for arg in instr.args]
+            instr.args = [
+                dict(arg) if isinstance(arg, dict) else arg for arg in instr.args
+            ]
             continue
 
         constant_values = []
@@ -575,9 +580,7 @@ def evaluate_pure_regions(tir):
             if constant_values:
                 const_sum = sum(constant_values)
                 instr.partial_constant = const_sum
-                dynamic_args = [
-                    {"kind": "const", "value": const_sum}
-                ] + dynamic_args
+                dynamic_args = [{"kind": "const", "value": const_sum}] + dynamic_args
             instr.args = dynamic_args
 
     return tir
@@ -687,6 +690,8 @@ def inline_pure_regions(tir):
                 value_scopes[instr.produces] = parent
 
     return tir
+
+
 def reorder_pure_ops(tir):
     """Reorder instructions by effect grade while respecting dependencies."""
 
@@ -943,34 +948,32 @@ def compile_and_evaluate(src, ffi_decls=None):
                 FFI_REGISTRY[name] = decl
 
 
-
-
 __all__ = [
-    'build_tir',
-    '_instruction_identity',
-    '_normalize_args',
-    'compute_tir_distance',
-    '_mutate_byte',
-    'continuous_semantics_profile',
-    '_wasm_local_name',
-    '_format_wasm_list',
-    'tir_to_wat',
-    'export_wasm_module',
-    'fold_constants',
-    '_resolve_alias',
-    '_rewrite_arg',
-    '_freeze_arg',
-    '_iter_targets',
-    'evaluate_pure_regions',
-    'common_subexpression_elimination',
-    'dead_code_elimination',
-    'inline_pure_regions',
-    'reorder_pure_ops',
-    'schedule_effects',
-    'inline_trivial_io',
-    'optimize_tir',
-    'transpile_totem_to_tir',
-    'transpile_to_totem_ir',
-    'list_optimizers',
-    'compile_and_evaluate'
+    "build_tir",
+    "_instruction_identity",
+    "_normalize_args",
+    "compute_tir_distance",
+    "_mutate_byte",
+    "continuous_semantics_profile",
+    "_wasm_local_name",
+    "_format_wasm_list",
+    "tir_to_wat",
+    "export_wasm_module",
+    "fold_constants",
+    "_resolve_alias",
+    "_rewrite_arg",
+    "_freeze_arg",
+    "_iter_targets",
+    "evaluate_pure_regions",
+    "common_subexpression_elimination",
+    "dead_code_elimination",
+    "inline_pure_regions",
+    "reorder_pure_ops",
+    "schedule_effects",
+    "inline_trivial_io",
+    "optimize_tir",
+    "transpile_totem_to_tir",
+    "transpile_to_totem_ir",
+    "list_optimizers",
+    "compile_and_evaluate",
 ]

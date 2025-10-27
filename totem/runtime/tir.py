@@ -1,4 +1,5 @@
 """Totem Intermediate Representation and lowering utilities."""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -64,7 +65,9 @@ class TIRProgram:
 
     def emit(self, op, typ, grade, args, scope_path, metadata=None, produces=None):
         vid = self.new_id()
-        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, metadata, produces)
+        instr = TIRInstruction(
+            vid, op, typ, grade, args, scope_path, metadata, produces
+        )
         self.instructions.append(instr)
         return vid
 
@@ -197,7 +200,7 @@ def emit_mlir_module(tir):
 
         operand_list = ", ".join(operands)
         line = (
-            f"    %{result_name} = \"totem.{instr.op.lower()}\"({operand_list}) : "
+            f'    %{result_name} = "totem.{instr.op.lower()}"({operand_list}) : '
             f"({operand_sig}) -> {_mlir_type(instr.typ)}{attr_str}"
         )
         lines.append(line.rstrip())
@@ -326,7 +329,9 @@ class BytecodeVM:
             self._step(instr)
 
         final_grade = EFFECT_GRADES[self._effect_index]
-        return BytecodeResult(final_grade, list(self.log), list(self.stack), dict(self.env))
+        return BytecodeResult(
+            final_grade, list(self.log), list(self.stack), dict(self.env)
+        )
 
     # -- internal helpers -------------------------------------------------
 
@@ -401,7 +406,9 @@ def assemble_bytecode(tir):
                 args.append((arg.get("kind"), arg.get("target")))
             else:
                 args.append((None, arg))
-        program.append(BytecodeInstruction(instr.id, instr.op, instr.grade, args, instr.produces))
+        program.append(
+            BytecodeInstruction(instr.id, instr.op, instr.grade, args, instr.produces)
+        )
     return program
 
 

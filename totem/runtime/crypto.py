@@ -1,4 +1,5 @@
 """Cryptographic helpers for Totem."""
+
 from __future__ import annotations
 
 from ..constants import KEY_FILE, PUB_FILE
@@ -10,6 +11,7 @@ try:  # pragma: no cover - optional dependency
     from cryptography.exceptions import InvalidSignature
 except ImportError:  # pragma: no cover
     rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
+
 
 def ensure_keypair():  # pragma: no cover
     """Create an RSA keypair if it doesn't exist."""
@@ -95,10 +97,4 @@ def verify_signature(sha256_hex, signature_hex):  # pragma: no cover
         return False
 
 
-
-
-__all__ = [
-    'ensure_keypair',
-    'sign_hash',
-    'verify_signature'
-]
+__all__ = ["ensure_keypair", "sign_hash", "verify_signature"]

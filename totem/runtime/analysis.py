@@ -1,4 +1,5 @@
 """Analysis and evaluation utilities for the Totem runtime."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -60,6 +61,7 @@ from .core import (
 )
 from .meta import MetaObject, _unwrap_meta_tir
 from .tir import TIRProgram, assemble_bytecode, run_bytecode
+
 
 def structural_decompress(src):
     """Build scope tree and typed node graph from raw characters."""
@@ -190,7 +192,9 @@ def verify_ffi_calls(scope, errors):
                 errors.append(
                     f"FFI {decl.name} arity mismatch: expected {decl.arity}, got {actual_arity}"
                 )
-            for idx, (expected_type, borrow) in enumerate(zip(decl.arg_types, node.borrows)):
+            for idx, (expected_type, borrow) in enumerate(
+                zip(decl.arg_types, node.borrows)
+            ):
                 target_node = getattr(borrow.target, "owner_node", None)
                 actual_type = getattr(target_node, "typ", None)
                 if actual_type and actual_type != expected_type:
@@ -264,7 +268,9 @@ def explain_grade(root_scope, target_grade):
 
     grade = target_grade.lower()
     if grade not in EFFECT_GRADES:
-        raise ValueError(f"Unknown grade '{target_grade}'. Choose from {EFFECT_GRADES}.")
+        raise ValueError(
+            f"Unknown grade '{target_grade}'. Choose from {EFFECT_GRADES}."
+        )
 
     target_idx = EFFECT_GRADES.index(grade)
     grades = {}
@@ -319,9 +325,7 @@ def _index_lifetimes(root_scope):
 def explain_borrow(root_scope, identifier):
     """Return a nested description of a borrow chain for ``identifier``."""
 
-    lifetime_by_id, owner_node, node_by_id, borrow_owners = _index_lifetimes(
-        root_scope
-    )
+    lifetime_by_id, owner_node, node_by_id, borrow_owners = _index_lifetimes(root_scope)
 
     target_life = None
 
@@ -344,15 +348,11 @@ def explain_borrow(root_scope, identifier):
 
         scope_line = _scope_full_path(life.owner_scope)
         end_line = (
-            _scope_full_path(life.end_scope)
-            if life.end_scope is not None
-            else "?"
+            _scope_full_path(life.end_scope) if life.end_scope is not None else "?"
         )
         owner = owner_node.get(life.id)
         owner_label = (
-            f"node {owner.op} ({owner.id})"
-            if owner is not None
-            else "<unknown node>"
+            f"node {owner.op} ({owner.id})" if owner is not None else "<unknown node>"
         )
         lines.append(
             f"{prefix}Lifetime {life.id} owned by {owner_label} in {scope_line}, ends at {end_line}"
@@ -375,9 +375,9 @@ def explain_borrow(root_scope, identifier):
             )
             borrower_scope = _scope_full_path(borrow.borrower_scope)
             outlives = ""
-            if life.end_scope is not None and _scope_depth(borrow.borrower_scope) > _scope_depth(
-                life.end_scope
-            ):
+            if life.end_scope is not None and _scope_depth(
+                borrow.borrower_scope
+            ) > _scope_depth(life.end_scope):
                 outlives = " (⚠ outlives owner scope)"
 
             lines.append(
@@ -413,7 +413,9 @@ def visualize_graph(root, script="purity"):  # pragma: no cover
     """
 
     if nx is None or plt is None:
-        raise RuntimeError("Visualization requires networkx and matplotlib to be installed")
+        raise RuntimeError(
+            "Visualization requires networkx and matplotlib to be installed"
+        )
 
     if script is True:
         script = "purity"
@@ -423,9 +425,7 @@ def visualize_graph(root, script="purity"):  # pragma: no cover
         raise TypeError("Visualization script must be a string of directives")
 
     commands = [
-        part.strip().lower()
-        for part in re.split(r"[;,+]+", script)
-        if part.strip()
+        part.strip().lower() for part in re.split(r"[;,+]+", script) if part.strip()
     ]
     if not commands:
         commands = ["purity"]
@@ -522,7 +522,9 @@ def visualize_graph(root, script="purity"):  # pragma: no cover
             font_size=8,
         )
         if dashed_edges:
-            nx.draw_networkx_edges(graph, positions, edgelist=dashed_edges, style="dashed")
+            nx.draw_networkx_edges(
+                graph, positions, edgelist=dashed_edges, style="dashed"
+            )
         plt.title(title)
         plt.tight_layout()
         plt.show()
@@ -595,9 +597,7 @@ def visualize_graph(root, script="purity"):  # pragma: no cover
                     width=2.5,
                     edge_color="#E65100",
                 )
-            ax.set_title(
-                "Temporal lifetime animation\n" + event["description"]
-            )
+            ax.set_title("Temporal lifetime animation\n" + event["description"])
             ax.margins(0.2)
             return []
 
@@ -866,7 +866,9 @@ def evaluate_node(node, env):
         message_id = capability.actor_system.next_message_id()
         payload = {"message": message_id, "to": capability.actor_id}
         message = OwnedMessage(payload, capability, message_id)
-        return Effect("pure", message, [f"K:msg({capability.actor_id},id={message_id})"])
+        return Effect(
+            "pure", message, [f"K:msg({capability.actor_id},id={message_id})"]
+        )
     elif op == "L":  # move the message into the actor system
         if not node.borrows:
             raise RuntimeError("L requires moving an OwnedMessage")
@@ -1029,9 +1031,7 @@ def _collect_aliasing_payload(scope):
                 )
 
     lifetimes.sort(key=lambda x: (x["id"], x["owner"], x.get("end")))
-    node_lifetimes.sort(
-        key=lambda x: (x["node"], x["owned_lifetime"], x["scope"])
-    )
+    node_lifetimes.sort(key=lambda x: (x["node"], x["owned_lifetime"], x["scope"]))
     borrows.sort(key=lambda x: (x["node"], x["kind"], x["target"]))
 
     duplicates = sorted([lid for lid, count in lifetime_counts.items() if count > 1])
@@ -1081,7 +1081,9 @@ def _collect_grade_payload(scope):
             max_grade_index = max(max_grade_index, EFFECT_GRADES.index(node.grade))
 
     node_entries.sort(key=lambda x: x["id"])
-    computed_grade = EFFECT_GRADES[max_grade_index] if node_entries else EFFECT_GRADES[0]
+    computed_grade = (
+        EFFECT_GRADES[max_grade_index] if node_entries else EFFECT_GRADES[0]
+    )
 
     payload = {
         "node_grades": node_entries,
@@ -1157,9 +1159,7 @@ class IncrementalAnalysis:
     def ok(self):
         """Return ``True`` when both aliasing and grade proofs succeed."""
 
-        return bool(self.aliasing.get("ok")) and bool(
-            self.grade_certificate.get("ok")
-        )
+        return bool(self.aliasing.get("ok")) and bool(self.grade_certificate.get("ok"))
 
     @property
     def diagnostics(self):
@@ -1238,8 +1238,10 @@ class IncrementalVerifier:
                 raise
 
         try:
-            runtime_mod = sys.modules.get('totem.runtime')
-            decompress = getattr(runtime_mod, 'structural_decompress', structural_decompress)
+            runtime_mod = sys.modules.get("totem.runtime")
+            decompress = getattr(
+                runtime_mod, "structural_decompress", structural_decompress
+            )
             tree = decompress(self._source)
             _ensure_lifetime_registration(tree)
             aliasing = _collect_aliasing_payload(tree)
@@ -1268,6 +1270,8 @@ class IncrementalVerifier:
         """Return the scope tree from the last completed analysis."""
 
         return self._last_tree
+
+
 def _node_to_dict(node):
     entry = {
         "id": node.id,
@@ -1291,33 +1295,31 @@ def _node_to_dict(node):
     return entry
 
 
-
-
 __all__ = [
-    'structural_decompress',
-    'check_aliasing',
-    'check_lifetimes',
-    'verify_ffi_calls',
-    '_scope_depth',
-    'compute_scope_grades',
-    '_collect_grade_cut',
-    'explain_grade',
-    '_index_lifetimes',
-    'explain_borrow',
-    'visualize_graph',
-    'iter_scopes',
-    'export_graphviz',
-    'print_scopes',
-    'evaluate_node',
-    'evaluate_scope',
-    'scope_to_dict',
-    '_certificate_payload_digest',
-    '_collect_aliasing_payload',
-    '_collect_grade_payload',
-    '_grade_certificate',
-    'build_bitcode_certificates',
-    '_ensure_lifetime_registration',
-    'IncrementalAnalysis',
-    'IncrementalVerifier',
-    '_node_to_dict'
+    "structural_decompress",
+    "check_aliasing",
+    "check_lifetimes",
+    "verify_ffi_calls",
+    "_scope_depth",
+    "compute_scope_grades",
+    "_collect_grade_cut",
+    "explain_grade",
+    "_index_lifetimes",
+    "explain_borrow",
+    "visualize_graph",
+    "iter_scopes",
+    "export_graphviz",
+    "print_scopes",
+    "evaluate_node",
+    "evaluate_scope",
+    "scope_to_dict",
+    "_certificate_payload_digest",
+    "_collect_aliasing_payload",
+    "_collect_grade_payload",
+    "_grade_certificate",
+    "build_bitcode_certificates",
+    "_ensure_lifetime_registration",
+    "IncrementalAnalysis",
+    "IncrementalVerifier",
+    "_node_to_dict",
 ]

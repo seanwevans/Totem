@@ -1,4 +1,5 @@
 """Command-line interface for the Totem runtime."""
+
 from __future__ import annotations
 
 import argparse
@@ -36,11 +37,13 @@ from .core import _scope_full_path
 from .crypto import verify_signature
 from .tir import emit_llvm_ir, emit_mlir_module
 
+
 def _runtime_callable(name, fallback):
-    runtime_mod = sys.modules.get('totem.runtime')
+    runtime_mod = sys.modules.get("totem.runtime")
     if runtime_mod and hasattr(runtime_mod, name):
         return getattr(runtime_mod, name)
     return fallback
+
 
 def run_repl(history_limit=REPL_HISTORY_LIMIT):  # pragma: no cover
     """Interactive Totem shell."""
@@ -92,7 +95,7 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):  # pragma: no cover
             if cmd == ":viz":
                 entry = resolve_entry(parts[1] if len(parts) > 1 else None)
                 if entry:
-                    _runtime_callable('visualize_graph', visualize_graph)(entry["tree"])
+                    _runtime_callable("visualize_graph", visualize_graph)(entry["tree"])
                 continue
             if cmd == ":save":
                 entry = resolve_entry(parts[1] if len(parts) > 1 else None)
@@ -102,18 +105,24 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):  # pragma: no cover
                     filename = parts[2]
                 else:
                     filename = f"program_{entry['index']}.totem.json"
-                _runtime_callable('write_bitcode_document', write_bitcode_document)(entry["bitcode_doc"], filename)
+                _runtime_callable("write_bitcode_document", write_bitcode_document)(
+                    entry["bitcode_doc"], filename
+                )
                 continue
             if cmd == ":hash":
                 entry = resolve_entry(parts[1] if len(parts) > 1 else None)
                 if entry:
-                    h = _runtime_callable('hash_bitcode_document', hash_bitcode_document)(entry["bitcode_doc"])
+                    h = _runtime_callable(
+                        "hash_bitcode_document", hash_bitcode_document
+                    )(entry["bitcode_doc"])
                     print(f"SHA256(program_{entry['index']}) = {h}")
                 continue
             if cmd == ":bitcode":
                 entry = resolve_entry(parts[1] if len(parts) > 1 else None)
                 if entry:
-                    canon = _runtime_callable('canonicalize_bitcode', canonicalize_bitcode)(entry["bitcode_doc"])
+                    canon = _runtime_callable(
+                        "canonicalize_bitcode", canonicalize_bitcode
+                    )(entry["bitcode_doc"])
                     print(json.dumps(canon, indent=2))
                 continue
             if cmd == ":diff":
@@ -124,8 +133,12 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):  # pragma: no cover
                 entry_b = resolve_entry(parts[2])
                 if not entry_a or not entry_b:
                     continue
-                canon_a = _runtime_callable('canonicalize_bitcode', canonicalize_bitcode)(entry_a["bitcode_doc"])
-                canon_b = _runtime_callable('canonicalize_bitcode', canonicalize_bitcode)(entry_b["bitcode_doc"])
+                canon_a = _runtime_callable(
+                    "canonicalize_bitcode", canonicalize_bitcode
+                )(entry_a["bitcode_doc"])
+                canon_b = _runtime_callable(
+                    "canonicalize_bitcode", canonicalize_bitcode
+                )(entry_b["bitcode_doc"])
                 text_a = json.dumps(canon_a, indent=2, sort_keys=True).splitlines()
                 text_b = json.dumps(canon_b, indent=2, sort_keys=True).splitlines()
                 diff = list(
@@ -147,7 +160,9 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):  # pragma: no cover
             print(f"Unknown command: {cmd}")
             continue
 
-        tree, errors, result = _runtime_callable('compile_and_evaluate', compile_and_evaluate)(line)
+        tree, errors, result = _runtime_callable(
+            "compile_and_evaluate", compile_and_evaluate
+        )(line)
         counter += 1
         entry = {
             "index": counter,
@@ -155,7 +170,9 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):  # pragma: no cover
             "tree": tree,
             "errors": errors,
             "result": result,
-            "bitcode_doc": _runtime_callable('build_bitcode_document', build_bitcode_document)(tree, result),
+            "bitcode_doc": _runtime_callable(
+                "build_bitcode_document", build_bitcode_document
+            )(tree, result),
         }
         history.append(entry)
         if len(history) > history_limit:
@@ -242,22 +259,24 @@ def main(args):  # pragma: no cover
     params = parse_args(args)
 
     if params.diff:
-        _runtime_callable('diff_bitcodes', diff_bitcodes)(params.diff[0], params.diff[1])
+        _runtime_callable("diff_bitcodes", diff_bitcodes)(
+            params.diff[0], params.diff[1]
+        )
         return
     if params.hash:
-        _runtime_callable('hash_bitcode', hash_bitcode)(params.hash)
+        _runtime_callable("hash_bitcode", hash_bitcode)(params.hash)
         return
     if params.load:
-        _runtime_callable('reexecute_bitcode', reexecute_bitcode)(params.load)
+        _runtime_callable("reexecute_bitcode", reexecute_bitcode)(params.load)
         return
     if params.logbook:
-        _runtime_callable('show_logbook', show_logbook)()
+        _runtime_callable("show_logbook", show_logbook)()
         return
     if params.repl:
-        _runtime_callable('run_repl', run_repl)()
+        _runtime_callable("run_repl", run_repl)()
         return
     if params.verify:
-        ok = _runtime_callable('verify_signature', verify_signature)(
+        ok = _runtime_callable("verify_signature", verify_signature)(
             params.verify,
             input("Signature hex: ").strip(),
         )
@@ -284,25 +303,21 @@ def main(args):  # pragma: no cover
     if params.why_grade:
         print(f"\nWhy grade '{params.why_grade}':")
         try:
-            info = _runtime_callable('explain_grade', explain_grade)(tree, params.why_grade)
+            info = _runtime_callable("explain_grade", explain_grade)(
+                tree, params.why_grade
+            )
         except ValueError as exc:
             print(f"  ✗ {exc}")
         else:
             if not info["achieved"]:
-                print(
-                    "  "
-                    + "Grade not reached. Final grade: "
-                    + info["final_grade"]
-                )
+                print("  " + "Grade not reached. Final grade: " + info["final_grade"])
             elif not info["nodes"]:
                 print("  No nodes with that grade were found.")
             else:
                 print("  Minimal cut responsible for the requested grade:")
                 for node in info["nodes"]:
                     scope_path = _scope_full_path(node.scope)
-                    print(
-                        f"    • {node.op} [{node.grade}] id={node.id} @ {scope_path}"
-                    )
+                    print(f"    • {node.op} [{node.grade}] id={node.id} @ {scope_path}")
                     if node.borrows:
                         borrow_desc = ", ".join(
                             f"{b.kind}->{b.target.id}" for b in node.borrows
@@ -311,20 +326,26 @@ def main(args):  # pragma: no cover
 
     if params.why_borrow:
         print(f"\nBorrow analysis for '{params.why_borrow}':")
-        info = _runtime_callable('explain_borrow', explain_borrow)(tree, params.why_borrow)
+        info = _runtime_callable("explain_borrow", explain_borrow)(
+            tree, params.why_borrow
+        )
         if not info["found"]:
             print("  ✗ Identifier not found in this program.")
         else:
             for line in info["lines"]:
                 print("  " + line)
 
-    _runtime_callable('export_totem_bitcode', export_totem_bitcode)(tree, result, "program.totem.json")
-    _runtime_callable('record_run', record_run)("program.totem.json", result)
-    tir = _runtime_callable('build_tir', build_tir)(tree)
+    _runtime_callable("export_totem_bitcode", export_totem_bitcode)(
+        tree, result, "program.totem.json"
+    )
+    _runtime_callable("record_run", record_run)("program.totem.json", result)
+    tir = _runtime_callable("build_tir", build_tir)(tree)
     print("\nTIR:")
     print(tir)
 
-    profile = _runtime_callable('continuous_semantics_profile', continuous_semantics_profile)(params.src, base_tir=tir)
+    profile = _runtime_callable(
+        "continuous_semantics_profile", continuous_semantics_profile
+    )(params.src, base_tir=tir)
     print("\nContinuous semantics (Δ per byte):")
     if not profile:
         print("  (no bytes to mutate)")
@@ -345,7 +366,7 @@ def main(args):  # pragma: no cover
             )
     if params.wasm:
         try:
-            _runtime_callable('export_wasm_module', export_wasm_module)(
+            _runtime_callable("export_wasm_module", export_wasm_module)(
                 tir,
                 params.wasm,
                 capabilities=params.capabilities,
@@ -355,11 +376,11 @@ def main(args):  # pragma: no cover
             print(f"  ✗ {exc}")
         except NotImplementedError as exc:
             print(f"  ✗ {exc}")
-    mlir_module = _runtime_callable('emit_mlir_module', emit_mlir_module)(tir)
+    mlir_module = _runtime_callable("emit_mlir_module", emit_mlir_module)(tir)
     print("\nMLIR dialect:")
     print(mlir_module)
 
-    llvm_ir = _runtime_callable('emit_llvm_ir', emit_llvm_ir)(tir)
+    llvm_ir = _runtime_callable("emit_llvm_ir", emit_llvm_ir)(tir)
     print("\nLLVM IR (pure segment):")
     print(llvm_ir)
 
@@ -367,7 +388,6 @@ def main(args):  # pragma: no cover
         export_graphviz(tree, params.viz)
     if params.visualize:
         visualize_graph(tree, params.visualize)
-
 
 
 __all__ = [

@@ -263,11 +263,15 @@ def test_continuous_semantics_profile_and_mutator():
     base_tree = structural_decompress("ab")
     base_tir = build_tir(base_tree)
 
-    profile = continuous_semantics_profile("a]", base_tir=base_tir, mutate_fn=_mutate_byte)
+    profile = continuous_semantics_profile(
+        "a]", base_tir=base_tir, mutate_fn=_mutate_byte
+    )
     assert profile and profile[0]["distance"]["total"] >= 0
 
     # Mutator returning original char skips entries
-    profile_skip = continuous_semantics_profile("abc", base_tir=base_tir, mutate_fn=lambda ch: ch)
+    profile_skip = continuous_semantics_profile(
+        "abc", base_tir=base_tir, mutate_fn=lambda ch: ch
+    )
     assert profile_skip == []
 
 
@@ -291,7 +295,10 @@ def test_tir_to_wat_errors_and_export(temp_dir):
         tir_to_wat(tir)
 
     io_instr = TIRInstruction("v1", "G", "int32", "io", [{"target": "v0"}], "root")
-    tir.instructions = [TIRInstruction("v0", "A", "int32", "pure", [], "root"), io_instr]
+    tir.instructions = [
+        TIRInstruction("v0", "A", "int32", "pure", [], "root"),
+        io_instr,
+    ]
     with pytest.raises(PermissionError):
         tir_to_wat(tir)
 
@@ -300,7 +307,12 @@ def test_tir_to_wat_errors_and_export(temp_dir):
         tir_to_wat(tir, capabilities={"io.write"})
 
     io_instr.args = []
-    metadata = export_wasm_module(tir, temp_dir / "module.wat", capabilities={"io.write"}, metadata_path=temp_dir / "meta.json")
+    metadata = export_wasm_module(
+        tir,
+        temp_dir / "module.wat",
+        capabilities={"io.write"},
+        metadata_path=temp_dir / "meta.json",
+    )
     assert metadata["io_instructions"] == 1
 
 
@@ -534,7 +546,9 @@ def test_node_to_dict_and_reconstruct_scope_paths():
 
 def test_certificate_validation_errors():
     with pytest.raises(ValueError):
-        runtime_mod._validate_certificate("alias", None, {"ok": True, "payload_digest": "0", "summary": {}})
+        runtime_mod._validate_certificate(
+            "alias", None, {"ok": True, "payload_digest": "0", "summary": {}}
+        )
 
     with pytest.raises(ValueError):
         runtime_mod._validate_certificate(
@@ -579,7 +593,9 @@ def test_build_tir_match_cases_branch():
     ctor.owned_life.borrows.append(borrow)
     program = build_tir(root_scope)
     assert any(
-        instr.metadata.get("cases") for instr in program.instructions if instr.op == "SWITCH"
+        instr.metadata.get("cases")
+        for instr in program.instructions
+        if instr.op == "SWITCH"
     )
 
 
@@ -588,7 +604,9 @@ def test_compute_tir_distance_variants():
     base.instructions.append(TIRInstruction("v0", "A", "int32", "pure", [], "root"))
     other = TIRProgram()
     other.instructions.append(TIRInstruction("v0", "D", "int32", "pure", [], "root"))
-    other.instructions.append(TIRInstruction("v1", "A", "int32", "pure", ["v0"], "root"))
+    other.instructions.append(
+        TIRInstruction("v1", "A", "int32", "pure", ["v0"], "root")
+    )
     distance = compute_tir_distance(base, other)
     assert distance["total"] >= 1
 
@@ -636,6 +654,7 @@ def test_reorder_pure_ops_dependency_guards():
     result = reorder_pure_ops(tir)
     assert result.instructions
 
+
 def test_metaobject_repr_and_dict():
     root, first, _, _ = make_scope_with_borrow()
     meta_scope = MetaObject("Scope", root)
@@ -667,7 +686,9 @@ def test_evaluate_node_type_error_path():
 
 def test_evaluate_scope_existing_env():
     root, _, _, _ = make_scope_with_borrow()
-    env = {"__capabilities__": {"FileRead": runtime_mod.CAPABILITY_FACTORIES["FileRead"]()}}
+    env = {
+        "__capabilities__": {"FileRead": runtime_mod.CAPABILITY_FACTORIES["FileRead"]()}
+    }
     evaluate_scope(root, env)
     for kind in runtime_mod.CAPABILITY_FACTORIES:
         assert kind in env["__capabilities__"]

@@ -37,7 +37,9 @@ def test_optimize_tir_and_meta_operations():
     program = TIRProgram()
     const_a = program.emit("A", "int32", "pure", [], "root")
     const_d = program.emit("D", "int32", "pure", [], "root")
-    partial_add = program.emit("ADD", "int32", "pure", [const_a, "external"], "root.child")
+    partial_add = program.emit(
+        "ADD", "int32", "pure", [const_a, "external"], "root.child"
+    )
     program.emit("ADD", "int32", "pure", [const_a, const_d], "root.child")
     program.emit("C", "int32", "io", [partial_add], "root")
 
@@ -88,7 +90,9 @@ def test_bitcode_hash_diff_logbook_and_reexecution(tmp_path, capsys, monkeypatch
     diff_output = capsys.readouterr().out
     assert "Bitcodes differ" in diff_output
 
-    monkeypatch.setattr(runtime, "LOGBOOK_FILE", str(tmp_path / "logbook.jsonl"), raising=False)
+    monkeypatch.setattr(
+        runtime, "LOGBOOK_FILE", str(tmp_path / "logbook.jsonl"), raising=False
+    )
     monkeypatch.setattr(runtime, "sign_hash", lambda sha: f"sig:{sha}")
 
     entry = record_run(str(bitcode_path), result)
@@ -120,32 +124,44 @@ def test_crypto_helpers_require_dependencies():
 def test_main_argument_branches(monkeypatch, capsys):
     calls = []
 
-    monkeypatch.setattr(runtime, "diff_bitcodes", lambda a, b: calls.append(("diff", a, b)))
+    monkeypatch.setattr(
+        runtime, "diff_bitcodes", lambda a, b: calls.append(("diff", a, b))
+    )
     runtime.main(["--diff", "fileA", "fileB"])
     assert calls == [("diff", "fileA", "fileB")]
 
     calls.clear()
-    monkeypatch.setattr(runtime, "hash_bitcode", lambda path: calls.append(("hash", path)))
+    monkeypatch.setattr(
+        runtime, "hash_bitcode", lambda path: calls.append(("hash", path))
+    )
     runtime.main(["--hash", "program.totem.json"])
     assert calls == [("hash", "program.totem.json")]
 
     calls.clear()
-    monkeypatch.setattr(runtime, "reexecute_bitcode", lambda path: calls.append(("load", path)))
+    monkeypatch.setattr(
+        runtime, "reexecute_bitcode", lambda path: calls.append(("load", path))
+    )
     runtime.main(["--load", "program.totem.json"])
     assert calls == [("load", "program.totem.json")]
 
     calls.clear()
-    monkeypatch.setattr(runtime, "show_logbook", lambda limit=10: calls.append(("logbook", limit)))
+    monkeypatch.setattr(
+        runtime, "show_logbook", lambda limit=10: calls.append(("logbook", limit))
+    )
     runtime.main(["--logbook"])
     assert calls == [("logbook", 10)]
 
     calls.clear()
-    monkeypatch.setattr(runtime, "run_repl", lambda : calls.append(("repl", None)))
+    monkeypatch.setattr(runtime, "run_repl", lambda: calls.append(("repl", None)))
     runtime.main(["--repl"])
     assert calls == [("repl", None)]
 
     calls.clear()
-    monkeypatch.setattr(runtime, "verify_signature", lambda hash_value, sig: calls.append((hash_value, sig)) or True)
+    monkeypatch.setattr(
+        runtime,
+        "verify_signature",
+        lambda hash_value, sig: calls.append((hash_value, sig)) or True,
+    )
     monkeypatch.setattr("builtins.input", lambda prompt="": "feedface")
     runtime.main(["--verify", "abc123"])
     verify_output = capsys.readouterr().out
@@ -157,18 +173,20 @@ def test_main_argument_branches(monkeypatch, capsys):
     default_output = capsys.readouterr().out
     assert "Runtime evaluation:" in default_output
 
-    params = parse_args([
-        "--src",
-        "{ab}",
-        "--capability",
-        "io.read",
-        "--capability",
-        "io.write",
-        "--why-grade",
-        "io",
-        "--why-borrow",
-        "life-1",
-    ])
+    params = parse_args(
+        [
+            "--src",
+            "{ab}",
+            "--capability",
+            "io.read",
+            "--capability",
+            "io.write",
+            "--why-grade",
+            "io",
+            "--why-borrow",
+            "life-1",
+        ]
+    )
     assert params.capabilities == ["io.read", "io.write"]
     assert params.why_grade == "io"
     assert params.why_borrow == "life-1"
@@ -178,31 +196,49 @@ def test_main_with_analysis_overrides(monkeypatch, capsys):
     sample_tree = structural_decompress("{ab}")
     fake_result = type("Result", (), {"grade": "state", "log": ["log-entry"]})()
 
-    monkeypatch.setattr(runtime, "compile_and_evaluate", lambda src: (sample_tree, ["error"], fake_result))
+    monkeypatch.setattr(
+        runtime,
+        "compile_and_evaluate",
+        lambda src: (sample_tree, ["error"], fake_result),
+    )
     monkeypatch.setattr(runtime, "print_scopes", lambda tree: None)
-    monkeypatch.setattr(runtime, "explain_grade", lambda tree, grade: {
-        "achieved": True,
-        "final_grade": "state",
-        "nodes": [],
-    })
-    monkeypatch.setattr(runtime, "explain_borrow", lambda tree, ident: {
-        "identifier": ident,
-        "origin": "root",
-        "chain": [],
-        "found": True,
-        "lines": ["Borrow chain"],
-    })
-    monkeypatch.setattr(runtime, "export_totem_bitcode", lambda scope, effect, filename="program.totem.json": None)
+    monkeypatch.setattr(
+        runtime,
+        "explain_grade",
+        lambda tree, grade: {
+            "achieved": True,
+            "final_grade": "state",
+            "nodes": [],
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "explain_borrow",
+        lambda tree, ident: {
+            "identifier": ident,
+            "origin": "root",
+            "chain": [],
+            "found": True,
+            "lines": ["Borrow chain"],
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "export_totem_bitcode",
+        lambda scope, effect, filename="program.totem.json": None,
+    )
     monkeypatch.setattr(runtime, "record_run", lambda filename, result: None)
 
-    runtime.main([
-        "--src",
-        "{ab}",
-        "--why-grade",
-        "state",
-        "--why-borrow",
-        "life-1",
-    ])
+    runtime.main(
+        [
+            "--src",
+            "{ab}",
+            "--why-grade",
+            "state",
+            "--why-borrow",
+            "life-1",
+        ]
+    )
 
     output = capsys.readouterr().out
     assert "Grade not reached" not in output
@@ -232,9 +268,17 @@ def test_run_repl_handles_commands(monkeypatch, capsys, tmp_path):
     saved = []
     monkeypatch.setattr("builtins.input", fake_input)
     monkeypatch.setattr(runtime, "visualize_graph", lambda tree: saved.append("viz"))
-    monkeypatch.setattr(runtime, "write_bitcode_document", lambda doc, filename: saved.append(str(filename)))
+    monkeypatch.setattr(
+        runtime,
+        "write_bitcode_document",
+        lambda doc, filename: saved.append(str(filename)),
+    )
     monkeypatch.setattr(runtime, "record_run", lambda filename, result: None)
-    monkeypatch.setattr(runtime, "export_totem_bitcode", lambda scope, effect, filename="program.totem.json": None)
+    monkeypatch.setattr(
+        runtime,
+        "export_totem_bitcode",
+        lambda scope, effect, filename="program.totem.json": None,
+    )
 
     runtime.run_repl(history_limit=2)
 

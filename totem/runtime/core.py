@@ -1,4 +1,5 @@
 """Core runtime data structures for Totem."""
+
 from __future__ import annotations
 
 import hashlib
@@ -120,7 +121,9 @@ class IRNode:
 
 
 class Scope:
-    def __init__(self, name: str, parent: "Scope | None" = None, *, effect_cap=None, fence=None):
+    def __init__(
+        self, name: str, parent: "Scope | None" = None, *, effect_cap=None, fence=None
+    ):
         self.name = name
         self.parent = parent
         self.nodes: list[Node] = []
@@ -161,7 +164,9 @@ class MovedValue:
         return f"<moved:{self.origin_id}>"
 
 
-def read_env_value(env: dict[str, Any], lifetime_id: str | None, default: Any = None) -> Any:
+def read_env_value(
+    env: dict[str, Any], lifetime_id: str | None, default: Any = None
+) -> Any:
     """Fetch a lifetime's value while ensuring it has not been moved."""
 
     if lifetime_id is None:
@@ -172,7 +177,9 @@ def read_env_value(env: dict[str, Any], lifetime_id: str | None, default: Any = 
         raise KeyError(f"Unknown lifetime {lifetime_id}")
     val = env[lifetime_id]
     if isinstance(val, MovedValue):
-        raise RuntimeError(f"Lifetime {lifetime_id} has been moved and is no longer usable")
+        raise RuntimeError(
+            f"Lifetime {lifetime_id} has been moved and is no longer usable"
+        )
     return val
 
 

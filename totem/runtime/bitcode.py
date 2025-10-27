@@ -1,4 +1,5 @@
 """Totem Bitcode serialization helpers."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from .compiler import build_tir
 import sys
 
 from . import crypto as _crypto
+
 
 def build_bitcode_document(scope, result_effect):
     """Create an in-memory Totem Bitcode representation."""
@@ -141,7 +143,9 @@ def _validate_certificate(name, stored, expected):
         raise ValueError(f"{name} certificate indicates failure: {stored['summary']}")
 
     if not expected.get("ok"):
-        raise ValueError(f"{name} certificate recomputation failed: {expected['summary']}")
+        raise ValueError(
+            f"{name} certificate recomputation failed: {expected['summary']}"
+        )
 
 
 def verify_bitcode_document(doc):
@@ -248,10 +252,12 @@ def diff_bitcodes(file_a, file_b):
 def record_run(bitcode_filename, result_effect):
     """Append this run’s metadata to the Totem logbook, signed."""
     sha = hash_bitcode(bitcode_filename)
-    runtime_mod = sys.modules.get('totem.runtime')
-    signer = getattr(runtime_mod, 'sign_hash', getattr(_crypto, 'sign_hash', None))
+    runtime_mod = sys.modules.get("totem.runtime")
+    signer = getattr(runtime_mod, "sign_hash", getattr(_crypto, "sign_hash", None))
     if signer is None:
-        raise RuntimeError("Cryptography support is unavailable; install the 'cryptography' package")
+        raise RuntimeError(
+            "Cryptography support is unavailable; install the 'cryptography' package"
+        )
     sig = signer(sha)
 
     entry = {
@@ -275,7 +281,9 @@ def record_run(bitcode_filename, result_effect):
 
 def show_logbook(limit=10):
     """Display recent logbook entries."""
-    logbook_path = getattr(sys.modules.get('totem.runtime'), "LOGBOOK_FILE", LOGBOOK_FILE)
+    logbook_path = getattr(
+        sys.modules.get("totem.runtime"), "LOGBOOK_FILE", LOGBOOK_FILE
+    )
 
     try:
         with open(logbook_path, "r", encoding="utf-8") as f:
@@ -294,21 +302,19 @@ def show_logbook(limit=10):
             print(f"    log: {e['first_log']} → {e['last_log']}")
 
 
-
-
 __all__ = [
-    'build_bitcode_document',
-    'write_bitcode_document',
-    'export_totem_bitcode',
-    'load_totem_bitcode',
-    'reconstruct_scope',
-    '_validate_certificate',
-    'verify_bitcode_document',
-    'reexecute_bitcode',
-    'canonicalize_bitcode',
-    'hash_bitcode_document',
-    'hash_bitcode',
-    'diff_bitcodes',
-    'record_run',
-    'show_logbook'
+    "build_bitcode_document",
+    "write_bitcode_document",
+    "export_totem_bitcode",
+    "load_totem_bitcode",
+    "reconstruct_scope",
+    "_validate_certificate",
+    "verify_bitcode_document",
+    "reexecute_bitcode",
+    "canonicalize_bitcode",
+    "hash_bitcode_document",
+    "hash_bitcode",
+    "diff_bitcodes",
+    "record_run",
+    "show_logbook",
 ]

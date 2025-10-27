@@ -1,4 +1,5 @@
 """Capability primitives for the Totem runtime."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

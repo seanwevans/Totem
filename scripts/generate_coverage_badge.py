@@ -1,4 +1,5 @@
 """Generate a simple SVG coverage badge from a coverage XML report."""
+
 from __future__ import annotations
 
 import argparse

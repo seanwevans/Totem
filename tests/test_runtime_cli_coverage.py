@@ -60,13 +60,21 @@ def _stub_main_environment(monkeypatch, *, errors=None, profile=None):
     tree = SimpleNamespace(name="tree")
     result = SimpleNamespace(grade="io", log=["log-entry"])
 
-    monkeypatch.setattr(runtime_cli, "compile_and_evaluate", lambda src: (tree, errors or [], result))
+    monkeypatch.setattr(
+        runtime_cli, "compile_and_evaluate", lambda src: (tree, errors or [], result)
+    )
     monkeypatch.setattr(runtime_cli, "print_scopes", lambda tree: None)
 
-    monkeypatch.setattr(runtime, "export_totem_bitcode", lambda tree, res, filename: None)
+    monkeypatch.setattr(
+        runtime, "export_totem_bitcode", lambda tree, res, filename: None
+    )
     monkeypatch.setattr(runtime, "record_run", lambda filename, res: None)
     monkeypatch.setattr(runtime, "build_tir", lambda tree: "fake-tir")
-    monkeypatch.setattr(runtime, "continuous_semantics_profile", lambda src, base_tir: profile if profile is not None else [])
+    monkeypatch.setattr(
+        runtime,
+        "continuous_semantics_profile",
+        lambda src, base_tir: profile if profile is not None else [],
+    )
     monkeypatch.setattr(runtime, "emit_mlir_module", lambda tir: "mlir-module")
     monkeypatch.setattr(runtime, "emit_llvm_ir", lambda tir: "llvm-ir")
     monkeypatch.setattr(runtime_cli, "export_graphviz", lambda tree, output: None)

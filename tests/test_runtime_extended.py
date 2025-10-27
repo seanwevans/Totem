@@ -179,15 +179,25 @@ def test_actor_system_message_flow_and_errors():
 def _make_sample_tir():
     program = TIRProgram()
     program.instructions = [
-        TIRInstruction("v0", "MATCH", "int32", "pure", [{"target": "v_in"}], "root.fn", metadata={
-            "cases": [
-                {"constructor": ("A", 0), "tag": 0, "result": "then"},
-            ],
-            "default": "else",
-        }),
+        TIRInstruction(
+            "v0",
+            "MATCH",
+            "int32",
+            "pure",
+            [{"target": "v_in"}],
+            "root.fn",
+            metadata={
+                "cases": [
+                    {"constructor": ("A", 0), "tag": 0, "result": "then"},
+                ],
+                "default": "else",
+            },
+        ),
         TIRInstruction("v1", "A", "int32", "pure", [], "root.fn", produces="life"),
         TIRInstruction("v2", "F", "int32", "pure", ["v1"], "root.fn"),
-        TIRInstruction("v3", "G", "int32", "io", [{"kind": "borrow", "target": "v1"}], "root.fn"),
+        TIRInstruction(
+            "v3", "G", "int32", "io", [{"kind": "borrow", "target": "v1"}], "root.fn"
+        ),
     ]
     return program
 
@@ -199,7 +209,9 @@ def test_tir_transforms_and_distance_metrics():
     assert lowered.instructions[0].metadata["cases"][0]["constructor"] == ("A", 0)
 
     other = _make_sample_tir()
-    other.instructions[1] = TIRInstruction("u1", "B", "int32", "state", [], "root.fn", produces="life")
+    other.instructions[1] = TIRInstruction(
+        "u1", "B", "int32", "state", [], "root.fn", produces="life"
+    )
 
     dist = compute_tir_distance(tir, other)
     assert dist["total"] >= 1
@@ -231,13 +243,15 @@ def test_bytecode_vm_execution_and_assembly():
     assert vm_result.log
     assert vm_result.env
 
-    manual_program = BytecodeProgram([
-        BytecodeInstruction("x0", "A", "pure"),
-        BytecodeInstruction("x1", "B", "state"),
-        BytecodeInstruction("x2", "E", "pure", [("borrow", "x0")]),
-        BytecodeInstruction("x3", "G", "io", [("consume", "x2")]),
-        BytecodeInstruction("x4", "Z", "unknown"),
-    ])
+    manual_program = BytecodeProgram(
+        [
+            BytecodeInstruction("x0", "A", "pure"),
+            BytecodeInstruction("x1", "B", "state"),
+            BytecodeInstruction("x2", "E", "pure", [("borrow", "x0")]),
+            BytecodeInstruction("x3", "G", "io", [("consume", "x2")]),
+            BytecodeInstruction("x4", "Z", "unknown"),
+        ]
+    )
 
     vm = BytecodeVM()
     result = vm.execute(manual_program)
@@ -251,7 +265,9 @@ def test_continuous_semantics_profile_handles_mutations():
     src = "{ad}"
     tree = structural_decompress(src)
     base_tir = build_tir(tree)
-    profile = continuous_semantics_profile(src, base_tir=base_tir, mutate_fn=lambda c: chr(ord(c) + 1))
+    profile = continuous_semantics_profile(
+        src, base_tir=base_tir, mutate_fn=lambda c: chr(ord(c) + 1)
+    )
     assert all(entry["index"] >= 0 for entry in profile)
     assert any("distance" in entry for entry in profile)
 
@@ -428,4 +444,3 @@ def test_module_entrypoint(monkeypatch, tmp_path, capsys):
         sys.argv = argv
     output = capsys.readouterr().out
     assert "Totem" in output or "No logbook" in output
-
