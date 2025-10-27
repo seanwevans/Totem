@@ -191,6 +191,8 @@ class Capability:
         history=None,
         generation=0,
         active=True,
+        permissions=None,
+        revoked=False,
     ):
         self.kind = kind
         self.resource = resource
@@ -198,9 +200,19 @@ class Capability:
         self.history = history or []
         self.generation = generation
         self._active = active
+        self.permissions = None if permissions is None else frozenset(permissions)
+        self.revoked = revoked
 
-    def evolve(self, action, detail=None, state_updates=None):
-        if not self._active:
+    def evolve(
+        self,
+        action,
+        detail=None,
+        state_updates=None,
+        *,
+        permission_subset=None,
+        revoke=False,
+    ):
+        if not self.is_active:
             raise RuntimeError(f"Capability {self} already consumed")
 
         new_state = dict(self.state)
@@ -211,6 +223,28 @@ class Capability:
         new_history = list(self.history)
         new_history.append({"action": action, "detail": detail})
 
+        if revoke and permission_subset is not None:
+            raise ValueError("Cannot restrict permissions while revoking a capability")
+
+        if permission_subset is not None:
+            subset = frozenset(permission_subset)
+            if self.permissions is not None and not subset.issubset(self.permissions):
+                missing = sorted(subset.difference(self.permissions))
+                raise ValueError(
+                    f"Capability {self} cannot grant permissions outside of its scope: {missing}"
+                )
+            new_permissions = subset
+            new_revoked = False
+            new_active = True
+        elif revoke:
+            new_permissions = frozenset()
+            new_revoked = True
+            new_active = False
+        else:
+            new_permissions = self.permissions
+            new_revoked = self.revoked
+            new_active = True
+
         self._active = False
 
         return Capability(
@@ -219,11 +253,21 @@ class Capability:
             state=new_state,
             history=new_history,
             generation=self.generation + 1,
+            permissions=new_permissions,
+            active=new_active,
+            revoked=new_revoked,
         )
 
     @property
     def is_active(self):
-        return self._active
+        return self._active and not self.revoked
+
+    def has_permission(self, permission):
+        if self.revoked:
+            return False
+        if self.permissions is None:
+            return True
+        return permission in self.permissions
 
     def __repr__(self):
         return f"<Capability {self.kind}@{self.generation}>"
@@ -254,6 +298,8 @@ def _clone_list(source):
 
 
 def use_file_read(cap):
+    if not cap.has_permission("read"):
+        raise RuntimeError(f"Capability {cap} does not permit read operations")
     index = cap.state.get("index", 0)
     contents = cap.state.get("contents", [])
     if index < len(contents):
@@ -265,6 +311,8 @@ def use_file_read(cap):
 
 
 def use_file_write(cap, payload):
+    if not cap.has_permission("write"):
+        raise RuntimeError(f"Capability {cap} does not permit write operations")
     writes = _clone_list(cap.state.get("writes", []))
     writes.append(payload)
     new_cap = cap.evolve("write", payload, {"writes": writes})
@@ -272,6 +320,8 @@ def use_file_write(cap, payload):
 
 
 def use_net_send(cap, payload):
+    if not cap.has_permission("send"):
+        raise RuntimeError(f"Capability {cap} does not permit network send operations")
     transmissions = _clone_list(cap.state.get("transmissions", []))
     transmissions.append(payload)
     ack = f"sent:{payload}"
@@ -284,16 +334,19 @@ CAPABILITY_FACTORIES = {
         "FileRead",
         resource="input",
         state={"index": 0, "contents": ["input_data"]},
+        permissions={"read"},
     ),
     "FileWrite": lambda: Capability(
         "FileWrite",
         resource="output",
         state={"writes": []},
+        permissions={"write"},
     ),
     "NetSend": lambda: Capability(
         "NetSend",
         resource="socket",
         state={"transmissions": []},
+        permissions={"send"},
     ),
 }
 
