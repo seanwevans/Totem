@@ -1,83 +1,33 @@
-name: recommit
-description: Run formatting commands and recommit results if necessary.
-author: Totem Maintainers
+name: "Recommit"
+description: "Commit and push any repository changes"
 inputs:
-  commands:
-    description: Shell commands to execute before attempting a commit.
-    required: true
-  token:
-    description: Token used for pushing commits.
-    required: true
   commit_message:
-    description: Commit message to use when changes are produced.
-    default: chore: automated formatting
+    description: "Commit message to use when committing changes"
     required: false
-  head_ref:
-    description: Target branch ref for pushes (pull request head or current ref).
-    default: ""
+    default: "Apply automatic changes"
+  user_name:
+    description: "User name for git commits"
     required: false
-  head_repository:
-    description: Repository that owns the head branch (used to detect forks).
-    default: ""
+    default: "github-actions[bot]"
+  user_email:
+    description: "User email for git commits"
     required: false
+    default: "41898282+github-actions[bot]@users.noreply.github.com"
 runs:
-  using: composite
+  using: "composite"
   steps:
-    - name: Run commands
+    - name: Configure git user
       shell: bash
       run: |
-        set -euo pipefail
-        ${INPUT_COMMANDS}
-      env:
-        INPUT_COMMANDS: ${{ inputs.commands }}
-
+        git config user.name "${{ inputs.user_name }}"
+        git config user.email "${{ inputs.user_email }}"
     - name: Commit changes if present
       shell: bash
-      env:
-        TOKEN: ${{ inputs.token }}
-        COMMIT_MESSAGE: ${{ inputs.commit_message }}
-        HEAD_REF: ${{ inputs.head_ref }}
-        HEAD_REPOSITORY: ${{ inputs.head_repository }}
-        GITHUB_REPOSITORY: ${{ github.repository }}
       run: |
-        set -euo pipefail
-
-        # Stage only modifications to already-tracked files to avoid committing
-        # formatter caches or other artifacts that may be created during the run.
-        git add -u
-        if git diff --cached --quiet; then
-          echo "No formatting changes detected."
+        if [[ -z "$(git status --porcelain)" ]]; then
+          echo "No changes to commit."
           exit 0
         fi
-
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-        git commit -m "$COMMIT_MESSAGE"
-
-        BRANCH_REF="$HEAD_REF"
-        if [ -z "$BRANCH_REF" ]; then
-          BRANCH_REF="${GITHUB_REF_NAME}"
-        fi
-
-        if [ -z "$BRANCH_REF" ]; then
-          BRANCH_REF="$(git rev-parse --abbrev-ref HEAD)"
-        fi
-
-        if [ -z "$BRANCH_REF" ]; then
-          echo "Unable to determine branch reference; skipping push."
-          exit 0
-        fi
-
-        if [ -n "$HEAD_REPOSITORY" ] && [ "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then
-          echo "Head repository ($HEAD_REPOSITORY) differs from base ($GITHUB_REPOSITORY); skipping push."
-          exit 0
-        fi
-
-        if [ -z "$TOKEN" ]; then
-          echo "No token provided; skipping push."
-          exit 0
-        fi
-
-        git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-        git push origin "HEAD:$BRANCH_REF" || echo "Failed to push formatting changes."
+        git add -A
+        git commit -m "${{ inputs.commit_message }}"
+        git push
