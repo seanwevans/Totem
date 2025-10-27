@@ -1,3 +1,5 @@
+[![CI](https://github.com/seanwevans/Totem/actions/workflows/ci.yml/badge.svg)](https://github.com/seanwevans/Totem/actions/workflows/ci.yml)
+
 # 🪶 Totem — A No-Syntax-Error Programming Language
 
 ## 🌐 Overview
