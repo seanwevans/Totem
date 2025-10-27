@@ -3020,7 +3020,13 @@ def transpile_totem_to_tir(src, *, optimize=True, ffi_decls=None):
 
     previous_registry = get_registered_ffi_declarations()
     if ffi_decls is not None:
-        register_ffi_declarations(ffi_decls, reset=True)
+        try:
+            register_ffi_declarations(ffi_decls, reset=True)
+        except Exception:
+            clear_ffi_registry()
+            for name, decl in previous_registry.items():
+                FFI_REGISTRY[name] = decl
+            raise
 
     try:
         tree = structural_decompress(src)
