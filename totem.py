@@ -30,10 +30,33 @@ from dataclasses import dataclass
 from datetime import datetime
 import difflib
 import hashlib
+import heapq
 import json
 from pathlib import Path
 import re
 import sys
+try:
+    import networkx as nx
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    nx = None
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    plt = None
+
+try:
+    import pydot
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pydot = None
+
+try:
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidSignature
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
 
 EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
 
@@ -53,6 +76,7 @@ OPS = {
     "E": {"grade": "pure"},
     "F": {"grade": "pure"},
     "G": {"grade": "io"},
+    "P": {"grade": "pure"},  # pattern match (pure control flow)
 }
 
 LOGBOOK_FILE = "totem.logbook.jsonl"
@@ -223,6 +247,16 @@ def _stable_id(scope_path, index):
     return hashlib.blake2s(token, digest_size=6).hexdigest()
 
 
+def _scope_full_path(scope):
+    """Return a human-readable scope path for display."""
+
+    parts = []
+    while scope is not None:
+        parts.append(scope.name)
+        scope = scope.parent
+    return " > ".join(reversed(parts))
+
+
 class Lifetime:
     def __init__(self, owner_scope, identifier):
         self.id = identifier
@@ -246,6 +280,12 @@ class Borrow:
         return f"{self.kind}→{self.target.id}@{self.borrower_scope.name}"
 
 
+def _arity_type_name(arity):
+    """Return the canonical Totem type name for a constructor of a given arity."""
+
+    return f"ADT<{arity}>"
+
+
 class Node:
     def __init__(self, op, typ, scope):
         scope_path = _scope_path(scope)
@@ -263,6 +303,9 @@ class Node:
         self.ffi = None
         self.ffi_capabilities = []
         self._apply_ffi_metadata()
+        self.meta = {}
+        self.arity = 0
+        self.update_type()
 
     def __repr__(self):
         return f"<{self.op}:{self.typ}@{self.scope.name}>"
@@ -275,6 +318,17 @@ class Node:
         self.grade = decl.grade
         self.typ = decl.return_type
         self.ffi_capabilities = list(decl.capabilities)
+    def update_type(self):
+        """Refresh this node's inferred type based on current metadata and borrows."""
+
+        self.arity = len(self.borrows)
+        if "fixed_type" in self.meta:
+            self.typ = self.meta["fixed_type"]
+        elif self.op == "P":
+            self.typ = "match"
+        else:
+            self.typ = _arity_type_name(self.arity)
+        return self.typ
 
 
 class IRNode:
@@ -289,13 +343,15 @@ class IRNode:
 
 
 class Scope:
-    def __init__(self, name, parent=None):
+    def __init__(self, name, parent=None, *, effect_cap=None, fence=None):
         self.name = name
         self.parent = parent
         self.nodes = []
         self.children = []
         self.lifetimes = []
         self.drops = []
+        self.effect_cap = effect_cap
+        self.fence = fence
         if parent:
             parent.children.append(self)
 
@@ -320,16 +376,28 @@ class Effect:
 class TIRInstruction:
     """Single SSA-like instruction."""
 
-    def __init__(self, id, op, typ, grade, args, scope_path):
+    def __init__(self, id, op, typ, grade, args, scope_path, produces=None metadata=None):    
         self.id = id
         self.op = op
         self.typ = typ
         self.grade = grade
         self.args = args
         self.scope_path = scope_path
+        self.produces = produces
 
     def __repr__(self):
-        args_str = ", ".join(self.args)
+        def fmt_arg(arg):
+            if isinstance(arg, dict):
+                target = arg.get("target")
+                kind = arg.get("kind")
+                if kind and target:
+                    return f"{kind}:{target}"
+                if target:
+                    return str(target)
+                return json.dumps(arg, sort_keys=True)
+            return str(arg)
+
+        args_str = ", ".join(fmt_arg(a) for a in self.args) if self.args else ""
         return f"{self.id} = {self.op}({args_str}) : {self.typ} [{self.grade}] @{self.scope_path}"
 
 
@@ -339,20 +407,341 @@ class TIRProgram:
     def __init__(self):
         self.instructions = []
         self.next_id = 0
+        self.constructor_tags = {}
+        self.next_tag = 0
 
     def new_id(self):
         vid = f"v{self.next_id}"
         self.next_id += 1
         return vid
 
-    def emit(self, op, typ, grade, args, scope_path):
+    def emit(self, op, typ, grade, args, scope_path, produces=None):
         vid = self.new_id()
-        instr = TIRInstruction(vid, op, typ, grade, args, scope_path)
+        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces, metadata)
         self.instructions.append(instr)
         return vid
 
+    def constructor_tag(self, op, arity):
+        key = (op, arity)
+        if key not in self.constructor_tags:
+            self.constructor_tags[key] = self.next_tag
+            self.next_tag += 1
+        return self.constructor_tags[key]
+
+    def desugar_pattern_matches(self):
+        """Lower MATCH instructions into SWITCHes on constructor tags."""
+
+        lowered = []
+        for instr in self.instructions:
+            if instr.op != "MATCH":
+                lowered.append(instr)
+                continue
+
+            cases = instr.metadata.get("cases", [])
+            default = instr.metadata.get("default")
+            switch_meta = {
+                "cases": [
+                    {
+                        "tag": case.get("tag"),
+                        "result": case.get("result"),
+                        "constructor": case.get("constructor"),
+                    }
+                    for case in cases
+                ]
+            }
+            if default is not None:
+                switch_meta["default"] = default
+
+            lowered.append(
+                TIRInstruction(
+                    instr.id,
+                    "SWITCH",
+                    instr.typ,
+                    instr.grade,
+                    instr.args,
+                    instr.scope_path,
+                    switch_meta,
+                )
+            )
+
+        self.instructions = lowered
+        return self
+
     def __repr__(self):
         return "\n".join(map(str, self.instructions))
+
+
+def _mlir_type(typ):
+    """Map Totem types to MLIR types."""
+
+    mapping = {
+        "int32": "i32",
+        "int64": "i64",
+        "float": "f32",
+        "double": "f64",
+    }
+    return mapping.get(typ, "i32")
+
+
+def emit_mlir_module(tir):
+    """Lower a TIR program to a textual MLIR module."""
+
+    lattice = ", ".join(f'"{grade}"' for grade in EFFECT_GRADES)
+    lines = [
+        f"module attributes {{totem.effect_lattice = [{lattice}]}} {{",
+        "  func.func @main() -> () {",
+    ]
+
+    value_map = {}
+
+    for instr in tir.instructions:
+        result_name = instr.id
+        operands = []
+        operand_types = []
+        borrow_kinds = []
+
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                target = arg.get("target")
+                kind = arg.get("kind")
+            else:
+                target = arg
+                kind = None
+
+            if not target:
+                continue
+
+            operand = value_map.get(target, target)
+            operands.append(f"%{operand}")
+            operand_types.append(_mlir_type(instr.typ))
+            if kind:
+                borrow_kinds.append(f'"{kind}"')
+
+        operand_sig = ", ".join(operand_types)
+        if not operand_sig:
+            operand_sig = ""
+        else:
+            operand_sig = f"{operand_sig}"
+
+        attrs = [f'grade = "{instr.grade}"']
+        if borrow_kinds:
+            attrs.append(f"borrow_kinds = [{', '.join(borrow_kinds)}]")
+
+        attr_str = " " + "{" + ", ".join(attrs) + "}" if attrs else ""
+
+        operand_list = ", ".join(operands)
+        line = (
+            f"    %{result_name} = \"totem.{instr.op.lower()}\"({operand_list}) : "
+            f"({operand_sig}) -> {_mlir_type(instr.typ)}{attr_str}"
+        )
+        lines.append(line.rstrip())
+
+        value_map[instr.id] = result_name
+        if instr.produces:
+            value_map[instr.produces] = result_name
+
+    lines.append("    func.return")
+    lines.append("  }")
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+PURE_CONSTANTS = {
+    "A": 1,
+    "D": 2,
+    "F": 5,
+}
+
+
+def emit_llvm_ir(tir):
+    """Emit a simple LLVM IR view for the pure portion of a TIR program."""
+
+    pure_instrs = [instr for instr in tir.instructions if instr.grade == "pure"]
+    if not pure_instrs:
+        return "; Totem program has no pure segment to lower"
+
+    lines = [
+        "; Totem pure segment lowered to LLVM IR",
+        "define void @totem_main() {",
+        "entry:",
+    ]
+
+    value_map = {}
+    declared = set()
+
+    def map_operand(target):
+        return f"%{value_map.get(target, target)}"
+
+    for instr in pure_instrs:
+        result_name = instr.id
+
+        if instr.op in PURE_CONSTANTS:
+            const_val = PURE_CONSTANTS[instr.op]
+            lines.append(f"  %{result_name} = add i32 0, {const_val}")
+        else:
+            operands = []
+            for arg in instr.args:
+                if isinstance(arg, dict):
+                    target = arg.get("target")
+                else:
+                    target = arg
+                if not target:
+                    continue
+                operands.append(map_operand(target))
+
+            operand_parts = [f"i32 {op}" for op in operands]
+            callee = f"@totem_{instr.op.lower()}"
+            declared.add(callee)
+            call_operands = ", ".join(operand_parts)
+            lines.append(
+                f"  %{result_name} = call i32 {callee}({call_operands})"
+                if call_operands
+                else f"  %{result_name} = call i32 {callee}()"
+            )
+
+        value_map[instr.id] = result_name
+        if instr.produces:
+            value_map[instr.produces] = result_name
+
+    lines.append("  ret void")
+    lines.append("}")
+
+    for callee in sorted(declared):
+        lines.append(f"declare i32 {callee}(...)")
+
+    return "\n".join(lines).rstrip()
+class BytecodeInstruction:
+    """Executable instruction in the bytecode VM."""
+
+    __slots__ = ("origin_id", "op", "grade", "args", "produces")
+
+    def __init__(self, origin_id, op, grade, args=None, produces=None):
+        self.origin_id = origin_id
+        self.op = op
+        self.grade = grade
+        self.args = args or []
+        self.produces = produces
+
+
+class BytecodeProgram:
+    """Linear bytecode representation assembled from TIR."""
+
+    def __init__(self, instructions=None):
+        self.instructions = instructions or []
+
+    def append(self, instruction):
+        self.instructions.append(instruction)
+
+
+class BytecodeResult:
+    """Execution artefact from the bytecode VM."""
+
+    def __init__(self, grade, log, stack, env):
+        self.grade = grade
+        self.log = log
+        self.stack = stack
+        self.env = env
+
+
+class BytecodeVM:
+    """A minimal stack-based interpreter for Totem TIR."""
+
+    def __init__(self):
+        self.stack = []
+        self.env = {}
+        self.log = []
+        self._effect_index = 0
+
+    def execute(self, program):
+        for instr in program.instructions:
+            self._step(instr)
+
+        final_grade = EFFECT_GRADES[self._effect_index]
+        return BytecodeResult(final_grade, list(self.log), list(self.stack), dict(self.env))
+
+    # -- internal helpers -------------------------------------------------
+
+    def _step(self, instr):
+        grade_index = self._grade_index(instr.grade)
+        self._effect_index = max(self._effect_index, grade_index)
+
+        value, log_entries = self._apply_operation(instr)
+
+        self.stack.append(value)
+        self.env[instr.origin_id] = value
+        if instr.produces:
+            self.env[instr.produces] = value
+
+        if log_entries:
+            if isinstance(log_entries, (list, tuple)):
+                self.log.extend(log_entries)
+            else:
+                self.log.append(log_entries)
+
+    def _grade_index(self, grade):
+        try:
+            return EFFECT_GRADES.index(grade)
+        except ValueError:
+            return 0
+
+    def _apply_operation(self, instr):
+        op = instr.op
+
+        if op == "A":
+            value = 1
+            return value, [f"A:{value}"]
+        if op == "B":
+            self.env["counter"] = self.env.get("counter", 0) + 1
+            value = self.env["counter"]
+            return value, [f"B:inc->{value}"]
+        if op == "C":
+            value = "input_data"
+            return value, [f"C:read->{value}"]
+        if op == "D":
+            value = 2
+            return value, [f"D:{value}"]
+        if op == "E":
+            base = 0
+            if instr.args:
+                target = instr.args[0][1]
+                base = self.env.get(target, 0)
+            value = base + 3
+            return value, [f"E:{value}"]
+        if op == "F":
+            value = 5
+            return value, [f"F:{value}"]
+        if op == "G":
+            target = instr.args[0][1] if instr.args else None
+            borrowed = self.env.get(target, "?")
+            value = True
+            return value, [f"G:write({borrowed})"]
+
+        # Fallback: produce zero value with a log entry for traceability.
+        value = 0
+        return value, [f"{op}:{value}"]
+
+
+def assemble_bytecode(tir):
+    """Linearise a TIR program into bytecode instructions."""
+
+    program = BytecodeProgram()
+    for instr in tir.instructions:
+        args = []
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                args.append((arg.get("kind"), arg.get("target")))
+            else:
+                args.append((None, arg))
+        program.append(BytecodeInstruction(instr.id, instr.op, instr.grade, args, instr.produces))
+    return program
+
+
+def run_bytecode(program):
+    """Execute a BytecodeProgram and return the resulting effect/log/stack."""
+
+    vm = BytecodeVM()
+    return vm.execute(program)
 
 
 class MetaObject:
@@ -385,22 +774,66 @@ class MetaObject:
 
 def structural_decompress(src):
     """Build scope tree and typed node graph from raw characters."""
+
+    def combine_caps(parent_cap, new_cap):
+        if parent_cap is None:
+            return new_cap
+        if new_cap is None:
+            return parent_cap
+        parent_idx = EFFECT_GRADES.index(parent_cap)
+        new_idx = EFFECT_GRADES.index(new_cap)
+        return EFFECT_GRADES[min(parent_idx, new_idx)]
+
     root = Scope("root")
-    current = root
+    stack = [(root, None, None)]  # (scope, expected_closer, opener)
     last_node = None
 
+    openers = {
+        "{": {"close": "}", "limit": None, "prefix": "scope", "label": "{}"},
+        "(": {"close": ")", "limit": "pure", "prefix": "pure", "label": "()"},
+        "[": {"close": "]", "limit": "state", "prefix": "state", "label": "[]"},
+        "<": {"close": ">", "limit": "io", "prefix": "io", "label": "<>"},
+    }
+
+    closers = {info["close"]: opener for opener, info in openers.items()}
+
     for ch in src:
-        if ch == "{":
-            s = Scope(f"scope_{len(current.children)}", current)
-            current = s
-        elif ch == "}":
-            for n in current.nodes:
-                n.owned_life.end_scope = current
-                current.lifetimes.append(n.owned_life)
-                current.drops.append(n.owned_life)
-            current = current.parent or current
+        current = stack[-1][0]
+
+        if ch in openers:
+            info = openers[ch]
+            inherited_cap = combine_caps(current.effect_cap, info["limit"])
+            name = f"{info['prefix']}_{len(current.children)}"
+            s = Scope(
+                name,
+                current,
+                effect_cap=inherited_cap,
+                fence=info["label"],
+            )
+            stack.append((s, info["close"], ch))
+        elif ch in closers:
+            if len(stack) == 1:
+                raise ValueError(f"Unmatched closing fence '{ch}'")
+            scope, expected, opener = stack.pop()
+            if ch != expected:
+                raise ValueError(
+                    f"Mismatched fence: opened with '{opener}' but closed with '{ch}'"
+                )
+            for n in scope.nodes:
+                n.owned_life.end_scope = scope
+                scope.lifetimes.append(n.owned_life)
+                scope.drops.append(n.owned_life)
         elif ch.isalpha():
             node = Node(op=ch.upper(), typ="int32", scope=current)
+            cap = current.effect_cap
+            if cap is not None:
+                node_idx = EFFECT_GRADES.index(node.grade)
+                cap_idx = EFFECT_GRADES.index(cap)
+                if node_idx > cap_idx:
+                    fence = current.fence or "scope"
+                    raise ValueError(
+                        f"Effect grade '{node.grade}' exceeds '{cap}' fence in {fence}"
+                    )
             current.nodes.append(node)
 
             if last_node and last_node.scope == current:
@@ -408,7 +841,12 @@ def structural_decompress(src):
                 b = Borrow(kind, last_node.owned_life, current)
                 node.borrows.append(b)
                 last_node.owned_life.borrows.append(b)
+            node.update_type()
             last_node = node
+
+    if len(stack) != 1:
+        _, expected, opener = stack[-1]
+        raise ValueError(f"Unclosed fence '{opener}' expected '{expected}'")
 
     return root
 
@@ -474,10 +912,182 @@ def _scope_depth(scope):
     return d
 
 
+def compute_scope_grades(scope, grades=None):
+    """Populate a mapping of Scope → grade index."""
+
+    if grades is None:
+        grades = {}
+
+    idx = 0
+    for node in scope.nodes:
+        idx = max(idx, EFFECT_GRADES.index(node.grade))
+    for child in scope.children:
+        child_idx = compute_scope_grades(child, grades)
+        idx = max(idx, child_idx)
+
+    grades[scope] = idx
+    return idx
+
+
+def _collect_grade_cut(scope, target_idx, grades):
+    """Return nodes responsible for lifting this scope to the target grade."""
+
+    contributors = []
+
+    for node in scope.nodes:
+        node_idx = EFFECT_GRADES.index(node.grade)
+        if node_idx >= target_idx:
+            contributors.append(node)
+
+    for child in scope.children:
+        if grades.get(child, -1) >= target_idx:
+            contributors.extend(_collect_grade_cut(child, target_idx, grades))
+
+    return contributors
+
+
+def explain_grade(root_scope, target_grade):
+    """Compute nodes that raise the program to ``target_grade``."""
+
+    grade = target_grade.lower()
+    if grade not in EFFECT_GRADES:
+        raise ValueError(f"Unknown grade '{target_grade}'. Choose from {EFFECT_GRADES}.")
+
+    target_idx = EFFECT_GRADES.index(grade)
+    grades = {}
+    compute_scope_grades(root_scope, grades)
+    root_idx = grades.get(root_scope, 0)
+
+    if root_idx < target_idx:
+        return {
+            "achieved": False,
+            "final_grade": EFFECT_GRADES[root_idx],
+            "nodes": [],
+        }
+
+    contributors = _collect_grade_cut(root_scope, target_idx, grades)
+    seen = set()
+    unique_nodes = []
+    for node in contributors:
+        if node.id in seen:
+            continue
+        seen.add(node.id)
+        unique_nodes.append(node)
+
+    unique_nodes.sort(key=lambda n: (_scope_path(n.scope), n.id))
+
+    return {
+        "achieved": True,
+        "final_grade": EFFECT_GRADES[root_idx],
+        "nodes": unique_nodes,
+    }
+
+
+def _index_lifetimes(root_scope):
+    """Return lookup tables for lifetimes, nodes, and borrow origins."""
+
+    lifetime_by_id = {}
+    owner_node = {}
+    borrow_owners = {}
+
+    for scope in iter_scopes(root_scope):
+        for node in scope.nodes:
+            life = node.owned_life
+            lifetime_by_id[life.id] = life
+            owner_node[life.id] = node
+            for borrow in node.borrows:
+                borrow_owners[borrow] = node
+
+    node_by_id = {node.id: node for node in owner_node.values()}
+
+    return lifetime_by_id, owner_node, node_by_id, borrow_owners
+
+
+def explain_borrow(root_scope, identifier):
+    """Return a nested description of a borrow chain for ``identifier``."""
+
+    lifetime_by_id, owner_node, node_by_id, borrow_owners = _index_lifetimes(
+        root_scope
+    )
+
+    target_life = None
+
+    if identifier in lifetime_by_id:
+        target_life = lifetime_by_id[identifier]
+    elif identifier in node_by_id:
+        target_life = node_by_id[identifier].owned_life
+    else:
+        return {
+            "found": False,
+            "identifier": identifier,
+            "lines": [],
+        }
+
+    def describe_lifetime(life, indent=0, seen=None):
+        if seen is None:
+            seen = set()
+        prefix = "  " * indent
+        lines = []
+
+        scope_line = _scope_full_path(life.owner_scope)
+        end_line = (
+            _scope_full_path(life.end_scope)
+            if life.end_scope is not None
+            else "?"
+        )
+        owner = owner_node.get(life.id)
+        owner_label = (
+            f"node {owner.op} ({owner.id})"
+            if owner is not None
+            else "<unknown node>"
+        )
+        lines.append(
+            f"{prefix}Lifetime {life.id} owned by {owner_label} in {scope_line}, ends at {end_line}"
+        )
+
+        if life.id in seen:
+            lines.append(f"{prefix}  ↺ cycle detected, stopping traversal")
+            return lines
+
+        seen.add(life.id)
+
+        if life.borrows:
+            lines.append(f"{prefix}  Borrows:")
+        for borrow in life.borrows:
+            borrower = borrow_owners.get(borrow)
+            borrower_label = (
+                f"node {borrower.op} ({borrower.id})"
+                if borrower is not None
+                else "<unknown node>"
+            )
+            borrower_scope = _scope_full_path(borrow.borrower_scope)
+            outlives = ""
+            if life.end_scope is not None and _scope_depth(borrow.borrower_scope) > _scope_depth(
+                life.end_scope
+            ):
+                outlives = " (⚠ outlives owner scope)"
+
+            lines.append(
+                f"{prefix}    - {borrow.kind} borrow by {borrower_label} at {borrower_scope}{outlives}"
+            )
+            if borrower is not None:
+                lines.extend(describe_lifetime(borrower.owned_life, indent + 3, seen))
+
+        seen.remove(life.id)
+        return lines
+
+    lines = describe_lifetime(target_life)
+    return {
+        "found": True,
+        "identifier": identifier,
+        "lines": lines,
+    }
+
+
 def visualize_graph(root):
     """Render the decompressed scope graph with color-coded purity and lifetime->borrow edges."""
-    import networkx as nx
-    import matplotlib.pyplot as plt
+    if nx is None or plt is None:
+        raise RuntimeError("Visualization requires networkx and matplotlib to be installed")
 
     G = nx.DiGraph()
     lifetime_nodes_added = set()
@@ -535,6 +1145,10 @@ def iter_scopes(scope):
 
 def export_graphviz(root, output_path):
     """Export a Graphviz SVG with scope clusters and lifetime borrow edges."""
+    import pydot
+
+    if pydot is None:
+        raise RuntimeError("Graphviz export requires the optional pydot dependency")
 
     import pydot
 
@@ -718,6 +1332,8 @@ def scope_to_dict(scope):
     """Recursively convert a Scope tree to a serializable dict."""
     return {
         "name": scope.name,
+        "effect_cap": scope.effect_cap,
+        "fence": scope.fence,
         "lifetimes": [
             {
                 "id": l.id,
@@ -735,7 +1351,23 @@ def scope_to_dict(scope):
             for l in scope.lifetimes
         ],
         "nodes": [
-            _node_to_dict(n)
+            {
+                "id": n.id,
+                "op": n.op,
+                "type": n.typ,
+                "arity": n.arity,
+                "grade": n.grade,
+                "lifetime_id": n.owned_life.id,
+                "meta": n.meta,
+                "borrows": [
+                    {
+                        "kind": b.kind,
+                        "target": b.target.id,
+                        "borrower_scope": b.borrower_scope.name,
+                    }
+                    for b in n.borrows
+                ],
+            }
             for n in scope.nodes
         ],
         "drops": [l.id for l in scope.drops],
@@ -804,7 +1436,12 @@ def load_totem_bitcode(filename):
 
 def reconstruct_scope(scope_dict, parent=None):
     """Rebuild a full Scope tree (with lifetimes and borrows) from a dictionary."""
-    scope = Scope(scope_dict["name"], parent)
+    scope = Scope(
+        scope_dict["name"],
+        parent,
+        effect_cap=scope_dict.get("effect_cap"),
+        fence=scope_dict.get("fence"),
+    )
 
     # First, create all nodes and lifetimes
     life_map = {}
@@ -813,6 +1450,8 @@ def reconstruct_scope(scope_dict, parent=None):
         node.grade = ninfo["grade"]
         node.typ = ninfo["type"]
         node.owned_life.id = ninfo["lifetime_id"]
+        node.meta = ninfo.get("meta", {}) or {}
+        node.arity = ninfo.get("arity", 0)
         life_map[node.owned_life.id] = node.owned_life
         ffi_info = ninfo.get("ffi")
         if ffi_info:
@@ -839,6 +1478,7 @@ def reconstruct_scope(scope_dict, parent=None):
                 b = Borrow(binfo["kind"], target_life, scope)
                 node.borrows.append(b)
                 target_life.borrows.append(b)
+        node.update_type()
 
     # Drops
     for did in scope_dict.get("drops", []):
@@ -979,9 +1619,10 @@ def show_logbook(limit=10):
 
 def ensure_keypair():
     """Create an RSA keypair if it doesn't exist."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    if rsa is None or serialization is None or default_backend is None:
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     try:
         with open(KEY_FILE, "rb") as f:
@@ -1013,8 +1654,10 @@ def ensure_keypair():
 
 def sign_hash(sha256_hex):
     """Sign a SHA256 hex digest with the private key."""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
+    if hashes is None or padding is None:
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     private_key = ensure_keypair()
     signature = private_key.sign(
@@ -1029,10 +1672,16 @@ def sign_hash(sha256_hex):
 
 def verify_signature(sha256_hex, signature_hex):
     """Verify a signature against the public key."""
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import padding
+    if (
+        InvalidSignature is None
+        or hashes is None
+        or serialization is None
+        or default_backend is None
+        or padding is None
+    ):
+        raise RuntimeError(
+            "Cryptographic operations require the optional 'cryptography' package"
+        )
 
     with open(PUB_FILE, "rb") as f:
         public_key = serialization.load_pem_public_key(
@@ -1059,12 +1708,50 @@ def build_tir(scope, program=None, prefix="root"):
 
     scope_path = prefix if prefix == "root" else f"{prefix}.{scope.name}"
 
-    for node in scope.nodes:
-        args = [b.target.id for b in node.borrows]
-        program.emit(node.op, node.typ, node.grade, args, scope_path)
+    for node in scope.nodes:        
+        args = [
+            {
+                "kind": "consume" if b.kind == "mut" else "borrow",
+                "target": b.target.id,
+            }
+            for b in node.borrows
+        ]
+        # Pattern match nodes are first emitted as MATCH before being desugared.
+        if node.op == "P" and "match_cases" in node.meta:
+            cases_meta = []
+            for ctor in node.meta["match_cases"]:
+                if isinstance(ctor, dict):
+                    ctor_key = tuple(ctor.get("constructor", (ctor.get("op"), ctor.get("arity", 0))))
+                    result = ctor.get("result")
+                else:
+                    ctor_key, result = ctor
+                op_name, arity = ctor_key
+                tag = program.constructor_tag(op_name, arity)
+                cases_meta.append(
+                    {
+                        "constructor": (op_name, arity),
+                        "tag": tag,
+                        "result": result,
+                    }
+                )
+
+            metadata = {"cases": cases_meta}
+            if "default_case" in node.meta:
+                metadata["default"] = node.meta["default_case"]
+
+            program.emit("MATCH", node.typ, node.grade, args, scope_path, metadata)
+            continue
+
+        arity = len(args)
+        constructor_tag = program.constructor_tag(node.op, arity)
+        metadata = {"constructor_tag": constructor_tag, "arity": arity}
+        program.emit(node.op, node.typ, node.grade, args, scope_path, metadata, produces=node.owned_life.id)
 
     for child in scope.children:
         build_tir(child, program, scope_path)
+
+    if prefix == "root":
+        program.desugar_pattern_matches()
 
     return program
 
@@ -1111,17 +1798,40 @@ def fold_constants(tir):
     for instr in tir.instructions:
         if instr.op in ("A", "D", "F"):  # treat as constant sources
             const_map[instr.id] = {"A": 1, "D": 2, "F": 5}[instr.op]
+            if instr.produces:
+                const_map[instr.produces] = const_map[instr.id]
             new_instrs.append(instr)
             continue
 
         # fold if all args are known constants
-        if all(a in const_map for a in instr.args) and instr.grade == "pure":
-            val = sum(const_map[a] for a in instr.args)  # naive demo fold
+        arg_targets = []
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                target = arg.get("target")
+            else:
+                target = arg
+            arg_targets.append(target)
+
+        if (
+            instr.grade == "pure"
+            and arg_targets
+            and all(t in const_map for t in arg_targets)
+        ):
+            val = sum(const_map[t] for t in arg_targets)  # naive demo fold
             folded = TIRInstruction(
-                instr.id, "CONST", "int32", "pure", [], instr.scope_path
+                instr.id,
+                "CONST",
+                "int32",
+                "pure",
+                [],
+                instr.scope_path,
+                metadata=instr.metadata,
+                produces=instr.produces,
             )
             folded.value = val
             const_map[instr.id] = val
+            if instr.produces:
+                const_map[instr.produces] = val
             new_instrs.append(folded)
         else:
             new_instrs.append(instr)
@@ -1131,10 +1841,153 @@ def fold_constants(tir):
 
 
 def reorder_pure_ops(tir):
-    """Move pure operations before impure ones (commuting pure ops upward)."""
-    pure = [i for i in tir.instructions if i.grade == "pure"]
-    impure = [i for i in tir.instructions if i.grade != "pure"]
-    tir.instructions = pure + impure
+    """Reorder instructions by effect grade while respecting dependencies."""
+
+    instructions = list(tir.instructions)
+    if not instructions:
+        return tir
+
+    grade_rank = {grade: idx for idx, grade in enumerate(EFFECT_GRADES)}
+    id_to_instr = {instr.id: instr for instr in instructions}
+    lifetime_producers = {
+        instr.produces: instr.id for instr in instructions if instr.produces
+    }
+
+    def iter_edges(instr):
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                kind = arg.get("kind")
+                if isinstance(kind, str):
+                    kind_key = kind.lower()
+                else:
+                    kind_key = None
+                yield kind_key, arg.get("target")
+            else:
+                yield None, arg
+
+    dependencies = {instr.id: set() for instr in instructions}
+    adjacency = {instr.id: set() for instr in instructions}
+    borrow_edges = []
+
+    for instr in instructions:
+        for kind, target in iter_edges(instr):
+            if not target:
+                continue
+            dep_id = None
+            if target in id_to_instr:
+                dep_id = target
+            elif target in lifetime_producers:
+                dep_id = lifetime_producers[target]
+            if dep_id and dep_id != instr.id:
+                dependencies[instr.id].add(dep_id)
+                adjacency[dep_id].add(instr.id)
+                if kind in {"borrow", "consume"}:
+                    borrow_edges.append((dep_id, instr.id))
+
+    original_index = {instr.id: idx for idx, instr in enumerate(instructions)}
+    scope_sequences = {}
+    for instr in instructions:
+        scope_sequences.setdefault(instr.scope_path, []).append(instr.id)
+
+    preceding_counts = {}
+    for scope, seq in scope_sequences.items():
+        seen = 0
+        for iid in seq:
+            preceding_counts[iid] = seen
+            seen += 1
+
+    scheduled_counts = {scope: 0 for scope in scope_sequences}
+
+    def is_fenced(scope_path):
+        return any("fence" in part.lower() for part in scope_path.split("."))
+
+    heap = []
+    for instr in instructions:
+        if not dependencies[instr.id]:
+            heapq.heappush(
+                heap,
+                (
+                    grade_rank.get(instr.grade, len(EFFECT_GRADES)),
+                    original_index[instr.id],
+                    instr.id,
+                ),
+            )
+
+    new_order = []
+    processed = set()
+    deferred = []
+
+    while heap:
+        grade, orig_idx, instr_id = heapq.heappop(heap)
+        instr = id_to_instr[instr_id]
+        scope = instr.scope_path
+        if is_fenced(scope) and scheduled_counts[scope] < preceding_counts[instr_id]:
+            deferred.append((grade, orig_idx, instr_id))
+            if not heap:
+                break
+            continue
+
+        new_order.append(instr_id)
+        processed.add(instr_id)
+        if is_fenced(scope):
+            scheduled_counts[scope] += 1
+
+        for item in deferred:
+            heapq.heappush(heap, item)
+        deferred.clear()
+
+        for succ in adjacency[instr_id]:
+            if succ in processed:
+                continue
+            dependencies[succ].discard(instr_id)
+            if not dependencies[succ]:
+                succ_instr = id_to_instr[succ]
+                heapq.heappush(
+                    heap,
+                    (
+                        grade_rank.get(succ_instr.grade, len(EFFECT_GRADES)),
+                        original_index[succ],
+                        succ,
+                    ),
+                )
+
+    if len(new_order) != len(instructions):
+        return tir
+
+    new_positions = {iid: idx for idx, iid in enumerate(new_order)}
+
+    for src, dst in borrow_edges:
+        orig_src = original_index[src]
+        orig_dst = original_index[dst]
+        if orig_src == orig_dst:
+            continue
+        lower = min(orig_src, orig_dst)
+        upper = max(orig_src, orig_dst)
+        new_src = new_positions.get(src)
+        new_dst = new_positions.get(dst)
+        if new_src is None or new_dst is None:
+            return tir
+        if new_src >= new_dst:
+            return tir
+        for instr in instructions:
+            orig_idx = original_index[instr.id]
+            if lower < orig_idx < upper:
+                new_idx = new_positions.get(instr.id)
+                if new_idx is None or not (new_src < new_idx < new_dst):
+                    return tir
+
+    for scope, ids in scope_sequences.items():
+        if not is_fenced(scope):
+            continue
+        positions = [new_positions[iid] for iid in ids]
+        sorted_positions = sorted(positions)
+        if positions != sorted_positions:
+            return tir
+        start = sorted_positions[0]
+        if sorted_positions != list(range(start, start + len(sorted_positions))):
+            return tir
+
+    tir.instructions = [id_to_instr[i] for i in new_order]
     return tir
 
 
@@ -1150,7 +2003,7 @@ def inline_trivial_io(tir):
 def list_optimizers():
     return {
         "fold_constants": "Constant folding for pure ops",
-        "reorder_pure_ops": "Commute pure ops before impure ops",
+        "reorder_pure_ops": "Effect-sensitive reordering by grade",
         "inline_trivial_io": "Replace deterministic IO reads with constants",
     }
 
@@ -1219,7 +2072,9 @@ def run_repl(history_limit=REPL_HISTORY_LIMIT):
             if cmd in (":quit", ":exit"):
                 break
             if cmd == ":help":
-                print("Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m")
+                print(
+                    "Commands: :help, :quit, :viz [n], :save [n] [file], :hash [n], :bitcode [n], :diff n m"
+                )
                 print(f"History: last {history_limit} programs cached.")
                 continue
             if cmd == ":viz":
@@ -1332,6 +2187,16 @@ def parse_args(args):
         metavar="OUTPUT",
         help="Export a Graphviz scope visualization to an SVG file",
     )
+    argp.add_argument(
+        "--why-grade",
+        metavar="GRADE",
+        help="Explain which nodes raised the program to a given effect grade",
+    )
+    argp.add_argument(
+        "--why-borrow",
+        metavar="ID",
+        help="Explain the borrow chain for a lifetime or node identifier",
+    )
 
     return argp.parse_args(args)
 
@@ -1376,11 +2241,56 @@ def main(args):
     for entry in result.log:
         print("   ", entry)
 
+    if params.why_grade:
+        print(f"\nWhy grade '{params.why_grade}':")
+        try:
+            info = explain_grade(tree, params.why_grade)
+        except ValueError as exc:
+            print(f"  ✗ {exc}")
+        else:
+            if not info["achieved"]:
+                print(
+                    "  "
+                    + "Grade not reached. Final grade: "
+                    + info["final_grade"]
+                )
+            elif not info["nodes"]:
+                print("  No nodes with that grade were found.")
+            else:
+                print("  Minimal cut responsible for the requested grade:")
+                for node in info["nodes"]:
+                    scope_path = _scope_full_path(node.scope)
+                    print(
+                        f"    • {node.op} [{node.grade}] id={node.id} @ {scope_path}"
+                    )
+                    if node.borrows:
+                        borrow_desc = ", ".join(
+                            f"{b.kind}->{b.target.id}" for b in node.borrows
+                        )
+                        print(f"        borrows: {borrow_desc}")
+
+    if params.why_borrow:
+        print(f"\nBorrow analysis for '{params.why_borrow}':")
+        info = explain_borrow(tree, params.why_borrow)
+        if not info["found"]:
+            print("  ✗ Identifier not found in this program.")
+        else:
+            for line in info["lines"]:
+                print("  " + line)
+
     export_totem_bitcode(tree, result, "program.totem.json")
     record_run("program.totem.json", result)
     tir = build_tir(tree)
     print("\nTIR:")
     print(tir)
+
+    mlir_module = emit_mlir_module(tir)
+    print("\nMLIR dialect:")
+    print(mlir_module)
+
+    llvm_ir = emit_llvm_ir(tir)
+    print("\nLLVM IR (pure segment):")
+    print(llvm_ir)
 
     if params.viz:
         export_graphviz(tree, params.viz)
