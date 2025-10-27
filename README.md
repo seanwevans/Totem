@@ -1,9 +1,4 @@
 # 🪶 Totem  
-### Every symbol sacred, every computation safe.
-
----
-
-## Overview
 
 **Totem** is a total, decompressive, typed language.  
 Every UTF-8 string is a valid Totem program — there are no syntax errors, ever.
