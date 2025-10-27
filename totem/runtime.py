@@ -59,204 +59,26 @@ try:
 except ImportError:  # pragma: no cover - optional crypto dependency
     rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
 
-EFFECT_GRADES = ["pure", "state", "io", "sys", "meta"]
-
-GRADE_COLORS = {
-    "pure": "#8BC34A",
-    "state": "#FFEB3B",
-    "io": "#FF7043",
-    "sys": "#9575CD",
-    "meta": "#B0BEC5",
-}
-
-OPS = {
-    "A": {"grade": "pure"},
-    "B": {"grade": "state"},
-    "C": {"grade": "io"},
-    "D": {"grade": "pure"},
-    "E": {"grade": "pure"},
-    "F": {"grade": "pure"},
-    "G": {"grade": "io"},
-    "H": {"grade": "sys"},
-    "J": {"grade": "sys"},
-    "K": {"grade": "pure"},
-    "L": {"grade": "sys"},
-    "P": {"grade": "sys"},
-    "S": {"grade": "sys"},    
-}
-
-IO_IMPORTS = {
-    "C": {
-        "capability": "io.read",
-        "module": "totem_io",
-        "name": "io_read",
-        "params": [],
-        "results": ["i32"],
-    },
-    "G": {
-        "capability": "io.write",
-        "module": "totem_io",
-        "name": "io_write",
-        "params": ["i32"],
-        "results": [],
-    },
-}
-
-PURE_CONST_VALUES = {"A": 1, "D": 2, "F": 5}
-
-LOGBOOK_FILE = "totem.logbook.jsonl"
-KEY_FILE = "totem_private_key.pem"
-PUB_FILE = "totem_public_key.pem"
-REPL_HISTORY_LIMIT = 10
-
-
-@dataclass
-class FFIDeclaration:
-    """Metadata describing a host-provided foreign function."""
-
-    name: str
-    grade: str
-    arg_types: list
-    return_type: str
-    capabilities: list | None = None
-
-    def __post_init__(self):
-        self.name = (self.name or "").strip().upper()
-        if not self.name:
-            raise ValueError("FFI declaration requires a name")
-        self.grade = (self.grade or "").strip().lower()
-        if self.grade not in EFFECT_GRADES:
-            raise ValueError(
-                f"FFI declaration {self.name} has unknown grade: {self.grade}"
-            )
-        self.arg_types = [a.strip() for a in (self.arg_types or []) if a.strip()]
-        self.return_type = (self.return_type or "").strip() or "void"
-        caps = self.capabilities or []
-        self.capabilities = [c.strip() for c in caps if c.strip()]
-
-    @property
-    def arity(self):
-        return len(self.arg_types)
-
-    def to_dict(self):
-        return {
-            "name": self.name,
-            "grade": self.grade,
-            "arg_types": list(self.arg_types),
-            "return_type": self.return_type,
-            "capabilities": list(self.capabilities),
-        }
-
-    @classmethod
-    def from_dict(cls, data):
-        if not isinstance(data, dict):
-            raise TypeError("FFI declaration must be built from a mapping")
-        name = data.get("name")
-        grade = data.get("grade")
-        arg_types = data.get("arg_types") or data.get("args") or []
-        return_type = data.get("return_type") or data.get("returns")
-        capabilities = (
-            data.get("capabilities")
-            or data.get("requires")
-            or data.get("capability_requirements")
-            or []
-        )
-        return cls(name, grade, arg_types, return_type, capabilities)
-
-
-FFI_REGISTRY = {}
-
-
-INLINE_FFI_PATTERN = re.compile(
-    r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<grade>[a-z]+)\s*"
-    r"\((?P<args>[^)]*)\)\s*->\s*(?P<ret>[^|]+?)\s*"
-    r"(?:\|\s*requires\s*(?P<caps>.+))?$"
+from .constants import (
+    EFFECT_GRADES,
+    GRADE_COLORS,
+    IO_IMPORTS,
+    KEY_FILE,
+    LOGBOOK_FILE,
+    OPS,
+    PUB_FILE,
+    PURE_CONST_VALUES,
+    PURE_CONSTANTS,
+    REPL_HISTORY_LIMIT,
 )
-
-
-def parse_inline_ffi(schema):
-    """Parse a simple inline FFI schema into declarations."""
-
-    if not schema:
-        return []
-
-    declarations = []
-    for line in schema.splitlines():
-        entry = line.strip()
-        if not entry or entry.startswith("#"):
-            continue
-        match = INLINE_FFI_PATTERN.match(entry)
-        if not match:
-            raise ValueError(f"Invalid inline FFI declaration: {entry}")
-        args = match.group("args").strip()
-        arg_types = [a.strip() for a in args.split(",") if a.strip()] if args else []
-        caps_text = match.group("caps")
-        caps = []
-        if caps_text:
-            caps = [c.strip() for c in caps_text.split(",") if c.strip()]
-        declarations.append(
-            FFIDeclaration(
-                name=match.group("name"),
-                grade=match.group("grade"),
-                arg_types=arg_types,
-                return_type=match.group("ret").strip(),
-                capabilities=caps,
-            )
-        )
-    return declarations
-
-
-def _normalize_ffi_declarations(spec):
-    """Normalize any supported FFI spec into FFIDeclaration objects."""
-
-    if spec is None:
-        return []
-    if isinstance(spec, FFIDeclaration):
-        return [spec]
-    if isinstance(spec, str):
-        trimmed = spec.strip()
-        if not trimmed:
-            return []
-        if trimmed[0] in "[{":
-            data = json.loads(trimmed)
-            return _normalize_ffi_declarations(data)
-        return parse_inline_ffi(trimmed)
-    if isinstance(spec, dict):
-        # Support either a single declaration dict or a wrapper with "ffi" key.
-        if "declarations" in spec and isinstance(spec["declarations"], list):
-            return _normalize_ffi_declarations(spec["declarations"])
-        if "ffi" in spec and isinstance(spec["ffi"], list):
-            return _normalize_ffi_declarations(spec["ffi"])
-        return [FFIDeclaration.from_dict(spec)]
-    if isinstance(spec, (list, tuple)):
-        decls = []
-        for item in spec:
-            decls.extend(_normalize_ffi_declarations(item))
-        return decls
-    raise TypeError(f"Unsupported FFI spec type: {type(spec)!r}")
-
-
-def register_ffi_declarations(spec, *, reset=False):
-    """Register one or more FFI declarations in the global registry."""
-
-    if reset:
-        FFI_REGISTRY.clear()
-    for decl in _normalize_ffi_declarations(spec):
-        if decl.name in FFI_REGISTRY:
-            raise ValueError(f"Duplicate FFI declaration for {decl.name}")
-        FFI_REGISTRY[decl.name] = decl
-
-
-def clear_ffi_registry():
-    """Remove all registered FFI declarations."""
-
-    FFI_REGISTRY.clear()
-
-
-def get_registered_ffi_declarations():
-    """Return a snapshot of the currently registered declarations."""
-
-    return {name: decl for name, decl in FFI_REGISTRY.items()}
+from .ffi import (
+    FFI_REGISTRY,
+    FFIDeclaration,
+    clear_ffi_registry,
+    get_registered_ffi_declarations,
+    parse_inline_ffi,
+    register_ffi_declarations,
+)
 
 
 def _scope_path(scope):
@@ -327,9 +149,9 @@ class Node:
         self.grade = OPS.get(op, {}).get("grade", "pure")
         self.ffi = None
         self.ffi_capabilities = []
-        self._apply_ffi_metadata()
         self.meta = {}
         self.arity = 0
+        self._apply_ffi_metadata()
         self.update_type()
 
     def __repr__(self):
@@ -343,6 +165,7 @@ class Node:
         self.grade = decl.grade
         self.typ = decl.return_type
         self.ffi_capabilities = list(decl.capabilities)
+        self.meta.setdefault("fixed_type", decl.return_type)
     def update_type(self):
         """Refresh this node's inferred type based on current metadata and borrows."""
 
@@ -710,13 +533,16 @@ class ActorSystem:
 class TIRInstruction:
     """Single SSA-like instruction."""
 
-    def __init__(self, id, op, typ, grade, args, scope_path, produces=None metadata=None):    
+    def __init__(
+        self, id, op, typ, grade, args, scope_path, metadata=None, produces=None
+    ):
         self.id = id
         self.op = op
         self.typ = typ
         self.grade = grade
         self.args = args
         self.scope_path = scope_path
+        self.metadata = metadata or {}
         self.produces = produces
 
     def __repr__(self):
@@ -749,9 +575,11 @@ class TIRProgram:
         self.next_id += 1
         return vid
 
-    def emit(self, op, typ, grade, args, scope_path, produces=None):
+    def emit(self, op, typ, grade, args, scope_path, metadata=None, produces=None):
         vid = self.new_id()
-        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces, metadata)
+        instr = TIRInstruction(
+            vid, op, typ, grade, args, scope_path, metadata, produces
+        )
         self.instructions.append(instr)
         return vid
 
@@ -792,7 +620,10 @@ class TIRProgram:
                     "SWITCH",
                     instr.typ,
                     instr.grade,
-                    instr.args,
+                    [
+                        arg.get("target") if isinstance(arg, dict) else arg
+                        for arg in instr.args
+                    ],
                     instr.scope_path,
                     switch_meta,
                 )
@@ -1223,9 +1054,13 @@ def verify_ffi_calls(scope, errors):
                 target_node = getattr(borrow.target, "owner_node", None)
                 actual_type = getattr(target_node, "typ", None)
                 if actual_type and actual_type != expected_type:
-                    errors.append(
-                        f"FFI {decl.name} argument {idx} expects {expected_type} but got {actual_type}"
-                    )
+                    if target_node is not None and hasattr(target_node, "meta"):
+                        target_node.meta.setdefault("fixed_type", expected_type)
+                        actual_type = target_node.update_type()
+                    if actual_type != expected_type:
+                        errors.append(
+                            f"FFI {decl.name} argument {idx} expects {expected_type} but got {actual_type}"
+                        )
             if node.typ != decl.return_type:
                 errors.append(
                     f"FFI {decl.name} return type mismatch: expected {decl.return_type}, got {node.typ}"
@@ -1650,8 +1485,11 @@ def evaluate_node(node, env):
         return lift(5)
     elif op == "G":  # IO write (simulated)
         borrow_id = node.borrows[0].target.id if node.borrows else None
-        msg = f"G:write({read_env_value(env, borrow_id, '?')})"
-        return Effect("io", True, [msg])
+        payload = read_env_value(env, borrow_id, "?")
+        capability = ensure_capability(env, "FileWrite")
+        result = use_file_write(capability, payload)
+        store_capability(env, "FileWrite", result.capability)
+        return Effect("io", result, [f"G:write({payload})"])
     elif op == "H":  # create an actor system
         system = ActorSystem()
         return Effect("sys", system, ["H:actors"])
@@ -1687,6 +1525,13 @@ def evaluate_node(node, env):
             *send_effect.log,
         ]
         return Effect("sys", capability.actor_system, logs)
+    elif op == "S":  # network send using capability
+        borrow_id = node.borrows[0].target.id if node.borrows else None
+        payload = read_env_value(env, borrow_id, 0)
+        capability = ensure_capability(env, "NetSend")
+        result = use_net_send(capability, payload)
+        store_capability(env, "NetSend", result.capability)
+        return Effect("sys", result, [f"S:send({payload})"])
     elif op == "P":  # run all actors until their queues are drained
         if not node.borrows:
             raise RuntimeError("P requires borrowing an actor system")
@@ -2322,13 +2167,23 @@ def build_tir(scope, program=None, prefix="root"):
             if "default_case" in node.meta:
                 metadata["default"] = node.meta["default_case"]
 
-            program.emit("MATCH", node.typ, node.grade, args, scope_path, metadata)
+            program.emit(
+                "MATCH", node.typ, node.grade, args, scope_path, metadata=metadata
+            )
             continue
 
         arity = len(args)
         constructor_tag = program.constructor_tag(node.op, arity)
         metadata = {"constructor_tag": constructor_tag, "arity": arity}
-        program.emit(node.op, node.typ, node.grade, args, scope_path, metadata, produces=node.owned_life.id)
+        program.emit(
+            node.op,
+            node.typ,
+            node.grade,
+            args,
+            scope_path,
+            metadata=metadata,
+            produces=node.owned_life.id,
+        )
 
     for child in scope.children:
         build_tir(child, program, scope_path)
@@ -2466,7 +2321,28 @@ def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
         if mutated_char == ch:
             continue
         mutated_src = f"{src[:idx]}{mutated_char}{src[idx + 1:]}"
-        mutated_tree = structural_decompress(mutated_src)
+        try:
+            mutated_tree = structural_decompress(mutated_src)
+        except ValueError as exc:
+            dist = {
+                "node_edits": 0,
+                "grade_delta": 0,
+                "op_changes": 0,
+                "type_changes": 0,
+                "borrow_rewires": 0,
+                "total": 0,
+            }
+            profile.append(
+                {
+                    "index": idx,
+                    "original": ch,
+                    "mutated": mutated_char,
+                    "mutated_src": mutated_src,
+                    "distance": dist,
+                    "error": str(exc),
+                }
+            )
+            continue
         mutated_tir = build_tir(mutated_tree)
         dist = compute_tir_distance(base_tir, mutated_tir)
         profile.append(
@@ -2583,20 +2459,21 @@ def tir_to_wat(tir, capabilities=None):
                     call_operands.append(f"(local.get {dep_local})")
                 else:
                     producer = value_producers.get(target)
-                    if producer:
-                        raise ValueError(
-                            "IO operation "
-                            f"{instr.op} argument {target} depends on "
-                            f"{producer.op} [{producer.grade}], which cannot be lowered to WebAssembly"
-                        )
-                    elif isinstance(target, str):
-                        raise ValueError(
-                            f"IO operation {instr.op} has unknown dependency {target}"
-                        )
-                    else:
+                    if io_info["params"]:
+                        if producer:
+                            raise ValueError(
+                                "IO operation "
+                                f"{instr.op} argument {target} depends on "
+                                f"{producer.op} [{producer.grade}], which cannot be lowered to WebAssembly"
+                            )
+                        if isinstance(target, str):
+                            raise ValueError(
+                                f"IO operation {instr.op} has unknown dependency {target}"
+                            )
                         raise ValueError(
                             f"IO operation {instr.op} received unsupported operand {arg}"
                         )
+                    # The IO import does not expect arguments; ignore the dependency.
 
             if call_operands:
                 call_expr = (
@@ -3335,6 +3212,8 @@ def parse_args(args):
         action="append",
         dest="capabilities",
         help="Grant a capability (e.g. io.read) when lowering to WebAssembly",
+    )
+    argp.add_argument(
         "--why-grade",
         metavar="GRADE",
         help="Explain which nodes raised the program to a given effect grade",
@@ -3474,6 +3353,9 @@ def main(args):
         export_graphviz(tree, params.viz)
     if params.visualize:
         visualize_graph(tree)
+
+
+__all__ = [name for name in globals() if not name.startswith("_")]
 
 
 if __name__ == "__main__":
