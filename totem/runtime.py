@@ -1863,7 +1863,13 @@ class IncrementalVerifier:
 
         previous_registry = get_registered_ffi_declarations()
         if self._ffi_decls is not None:
-            register_ffi_declarations(self._ffi_decls, reset=True)
+            try:
+                register_ffi_declarations(self._ffi_decls, reset=True)
+            except Exception:
+                clear_ffi_registry()
+                for name, decl in previous_registry.items():
+                    FFI_REGISTRY[name] = decl
+                raise
 
         try:
             tree = structural_decompress(self._source)
