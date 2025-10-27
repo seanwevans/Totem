@@ -132,13 +132,15 @@ class IRNode:
 
 
 class Scope:
-    def __init__(self, name, parent=None):
+    def __init__(self, name, parent=None, *, effect_cap=None, fence=None):
         self.name = name
         self.parent = parent
         self.nodes = []
         self.children = []
         self.lifetimes = []
         self.drops = []
+        self.effect_cap = effect_cap
+        self.fence = fence
         if parent:
             parent.children.append(self)
 
@@ -228,22 +230,66 @@ class MetaObject:
 
 def structural_decompress(src):
     """Build scope tree and typed node graph from raw characters."""
+
+    def combine_caps(parent_cap, new_cap):
+        if parent_cap is None:
+            return new_cap
+        if new_cap is None:
+            return parent_cap
+        parent_idx = EFFECT_GRADES.index(parent_cap)
+        new_idx = EFFECT_GRADES.index(new_cap)
+        return EFFECT_GRADES[min(parent_idx, new_idx)]
+
     root = Scope("root")
-    current = root
+    stack = [(root, None, None)]  # (scope, expected_closer, opener)
     last_node = None
 
+    openers = {
+        "{": {"close": "}", "limit": None, "prefix": "scope", "label": "{}"},
+        "(": {"close": ")", "limit": "pure", "prefix": "pure", "label": "()"},
+        "[": {"close": "]", "limit": "state", "prefix": "state", "label": "[]"},
+        "<": {"close": ">", "limit": "io", "prefix": "io", "label": "<>"},
+    }
+
+    closers = {info["close"]: opener for opener, info in openers.items()}
+
     for ch in src:
-        if ch == "{":
-            s = Scope(f"scope_{len(current.children)}", current)
-            current = s
-        elif ch == "}":
-            for n in current.nodes:
-                n.owned_life.end_scope = current
-                current.lifetimes.append(n.owned_life)
-                current.drops.append(n.owned_life)
-            current = current.parent or current
+        current = stack[-1][0]
+
+        if ch in openers:
+            info = openers[ch]
+            inherited_cap = combine_caps(current.effect_cap, info["limit"])
+            name = f"{info['prefix']}_{len(current.children)}"
+            s = Scope(
+                name,
+                current,
+                effect_cap=inherited_cap,
+                fence=info["label"],
+            )
+            stack.append((s, info["close"], ch))
+        elif ch in closers:
+            if len(stack) == 1:
+                raise ValueError(f"Unmatched closing fence '{ch}'")
+            scope, expected, opener = stack.pop()
+            if ch != expected:
+                raise ValueError(
+                    f"Mismatched fence: opened with '{opener}' but closed with '{ch}'"
+                )
+            for n in scope.nodes:
+                n.owned_life.end_scope = scope
+                scope.lifetimes.append(n.owned_life)
+                scope.drops.append(n.owned_life)
         elif ch.isalpha():
             node = Node(op=ch.upper(), typ="int32", scope=current)
+            cap = current.effect_cap
+            if cap is not None:
+                node_idx = EFFECT_GRADES.index(node.grade)
+                cap_idx = EFFECT_GRADES.index(cap)
+                if node_idx > cap_idx:
+                    fence = current.fence or "scope"
+                    raise ValueError(
+                        f"Effect grade '{node.grade}' exceeds '{cap}' fence in {fence}"
+                    )
             current.nodes.append(node)
 
             if last_node and last_node.scope == current:
@@ -252,6 +298,10 @@ def structural_decompress(src):
                 node.borrows.append(b)
                 last_node.owned_life.borrows.append(b)
             last_node = node
+
+    if len(stack) != 1:
+        _, expected, opener = stack[-1]
+        raise ValueError(f"Unclosed fence '{opener}' expected '{expected}'")
 
     return root
 
@@ -523,6 +573,8 @@ def scope_to_dict(scope):
     """Recursively convert a Scope tree to a serializable dict."""
     return {
         "name": scope.name,
+        "effect_cap": scope.effect_cap,
+        "fence": scope.fence,
         "lifetimes": [
             {
                 "id": l.id,
@@ -600,7 +652,12 @@ def load_totem_bitcode(filename):
 
 def reconstruct_scope(scope_dict, parent=None):
     """Rebuild a full Scope tree (with lifetimes and borrows) from a dictionary."""
-    scope = Scope(scope_dict["name"], parent)
+    scope = Scope(
+        scope_dict["name"],
+        parent,
+        effect_cap=scope_dict.get("effect_cap"),
+        fence=scope_dict.get("fence"),
+    )
 
     # First, create all nodes and lifetimes
     life_map = {}
