@@ -30,7 +30,6 @@ from datetime import datetime
 import hashlib
 import json
 import sys
-import uuid
 import networkx as nx
 import matplotlib.pyplot as plt
 
@@ -56,9 +55,22 @@ KEY_FILE = "totem_private_key.pem"
 PUB_FILE = "totem_public_key.pem"
 
 
+def _scope_path(scope):
+    parts = []
+    while scope is not None:
+        parts.append(scope.name)
+        scope = scope.parent
+    return ".".join(reversed(parts))
+
+
+def _stable_id(scope_path, index):
+    token = f"{scope_path}:{index}".encode("utf-8")
+    return hashlib.blake2s(token, digest_size=6).hexdigest()
+
+
 class Lifetime:
-    def __init__(self, owner_scope):
-        self.id = str(uuid.uuid4())[:6]
+    def __init__(self, owner_scope, identifier):
+        self.id = identifier
         self.owner_scope = owner_scope
         self.end_scope = None
         self.borrows = []
@@ -80,11 +92,15 @@ class Borrow:
 
 class Node:
     def __init__(self, op, typ, scope):
-        self.id = str(uuid.uuid4())[:6]
+        scope_path = _scope_path(scope)
+        node_index = len(scope.nodes)
+        self.id = _stable_id(scope_path, node_index)
         self.op = op
         self.typ = typ
         self.scope = scope
-        self.owned_life = Lifetime(scope)
+        life_scope_path = f"{scope_path}.life"
+        life_id = _stable_id(life_scope_path, node_index)
+        self.owned_life = Lifetime(scope, life_id)
         self.borrows = []
         self.grade = OPS.get(op, {}).get("grade", "pure")
 
@@ -487,8 +503,7 @@ def reconstruct_scope(scope_dict, parent=None):
 
     # Rebuild lifetimes (for visualization/debug)
     for linfo in scope_dict.get("lifetimes", []):
-        l = Lifetime(scope)
-        l.id = linfo["id"]
+        l = Lifetime(scope, linfo["id"])
         l.owner_scope = scope
         scope.lifetimes.append(l)
         life_map[l.id] = l
