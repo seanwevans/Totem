@@ -28,6 +28,7 @@ Pure ⊂ State ⊂ IO ⊂ Sys ⊂ Meta
 import argparse
 from datetime import datetime
 import hashlib
+import heapq
 import json
 import sys
 import uuid
@@ -135,16 +136,28 @@ class Effect:
 class TIRInstruction:
     """Single SSA-like instruction."""
 
-    def __init__(self, id, op, typ, grade, args, scope_path):
+    def __init__(self, id, op, typ, grade, args, scope_path, produces=None):
         self.id = id
         self.op = op
         self.typ = typ
         self.grade = grade
         self.args = args
         self.scope_path = scope_path
+        self.produces = produces
 
     def __repr__(self):
-        args_str = ", ".join(self.args)
+        def fmt_arg(arg):
+            if isinstance(arg, dict):
+                target = arg.get("target")
+                kind = arg.get("kind")
+                if kind and target:
+                    return f"{kind}:{target}"
+                if target:
+                    return str(target)
+                return json.dumps(arg, sort_keys=True)
+            return str(arg)
+
+        args_str = ", ".join(fmt_arg(a) for a in self.args) if self.args else ""
         return f"{self.id} = {self.op}({args_str}) : {self.typ} [{self.grade}] @{self.scope_path}"
 
 
@@ -160,9 +173,9 @@ class TIRProgram:
         self.next_id += 1
         return vid
 
-    def emit(self, op, typ, grade, args, scope_path):
+    def emit(self, op, typ, grade, args, scope_path, produces=None):
         vid = self.new_id()
-        instr = TIRInstruction(vid, op, typ, grade, args, scope_path)
+        instr = TIRInstruction(vid, op, typ, grade, args, scope_path, produces)
         self.instructions.append(instr)
         return vid
 
@@ -705,8 +718,21 @@ def build_tir(scope, program=None, prefix="root"):
     scope_path = prefix if prefix == "root" else f"{prefix}.{scope.name}"
 
     for node in scope.nodes:
-        args = [b.target.id for b in node.borrows]
-        program.emit(node.op, node.typ, node.grade, args, scope_path)
+        args = [
+            {
+                "kind": "consume" if b.kind == "mut" else "borrow",
+                "target": b.target.id,
+            }
+            for b in node.borrows
+        ]
+        program.emit(
+            node.op,
+            node.typ,
+            node.grade,
+            args,
+            scope_path,
+            produces=node.owned_life.id,
+        )
 
     for child in scope.children:
         build_tir(child, program, scope_path)
@@ -756,17 +782,39 @@ def fold_constants(tir):
     for instr in tir.instructions:
         if instr.op in ("A", "D", "F"):  # treat as constant sources
             const_map[instr.id] = {"A": 1, "D": 2, "F": 5}[instr.op]
+            if instr.produces:
+                const_map[instr.produces] = const_map[instr.id]
             new_instrs.append(instr)
             continue
 
         # fold if all args are known constants
-        if all(a in const_map for a in instr.args) and instr.grade == "pure":
-            val = sum(const_map[a] for a in instr.args)  # naive demo fold
+        arg_targets = []
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                target = arg.get("target")
+            else:
+                target = arg
+            arg_targets.append(target)
+
+        if (
+            instr.grade == "pure"
+            and arg_targets
+            and all(t in const_map for t in arg_targets)
+        ):
+            val = sum(const_map[t] for t in arg_targets)  # naive demo fold
             folded = TIRInstruction(
-                instr.id, "CONST", "int32", "pure", [], instr.scope_path
+                instr.id,
+                "CONST",
+                "int32",
+                "pure",
+                [],
+                instr.scope_path,
+                produces=instr.produces,
             )
             folded.value = val
             const_map[instr.id] = val
+            if instr.produces:
+                const_map[instr.produces] = val
             new_instrs.append(folded)
         else:
             new_instrs.append(instr)
@@ -776,10 +824,155 @@ def fold_constants(tir):
 
 
 def reorder_pure_ops(tir):
-    """Move pure operations before impure ones (commuting pure ops upward)."""
-    pure = [i for i in tir.instructions if i.grade == "pure"]
-    impure = [i for i in tir.instructions if i.grade != "pure"]
-    tir.instructions = pure + impure
+    """Reorder instructions by effect grade while respecting dependencies."""
+
+    instructions = list(tir.instructions)
+    if not instructions:
+        return tir
+
+    grade_rank = {grade: idx for idx, grade in enumerate(EFFECT_GRADES)}
+    id_to_instr = {instr.id: instr for instr in instructions}
+    lifetime_producers = {
+        instr.produces: instr.id for instr in instructions if instr.produces
+    }
+
+    def iter_edges(instr):
+        for arg in instr.args:
+            if isinstance(arg, dict):
+                kind = arg.get("kind")
+                if isinstance(kind, str):
+                    kind_key = kind.lower()
+                else:
+                    kind_key = None
+                yield kind_key, arg.get("target")
+            else:
+                yield None, arg
+
+    dependencies = {instr.id: set() for instr in instructions}
+    adjacency = {instr.id: set() for instr in instructions}
+    borrow_edges = []
+
+    for instr in instructions:
+        for kind, target in iter_edges(instr):
+            if not target:
+                continue
+            dep_id = None
+            if target in id_to_instr:
+                dep_id = target
+            elif target in lifetime_producers:
+                dep_id = lifetime_producers[target]
+            if dep_id and dep_id != instr.id:
+                dependencies[instr.id].add(dep_id)
+                adjacency[dep_id].add(instr.id)
+                if kind in {"borrow", "consume"}:
+                    borrow_edges.append((dep_id, instr.id))
+
+    original_index = {instr.id: idx for idx, instr in enumerate(instructions)}
+    scope_sequences = {}
+    for instr in instructions:
+        scope_sequences.setdefault(instr.scope_path, []).append(instr.id)
+
+    preceding_counts = {}
+    for scope, seq in scope_sequences.items():
+        seen = 0
+        for iid in seq:
+            preceding_counts[iid] = seen
+            seen += 1
+
+    scheduled_counts = {scope: 0 for scope in scope_sequences}
+
+    def is_fenced(scope_path):
+        return any("fence" in part.lower() for part in scope_path.split("."))
+
+    heap = []
+    for instr in instructions:
+        if not dependencies[instr.id]:
+            heapq.heappush(
+                heap,
+                (
+                    grade_rank.get(instr.grade, len(EFFECT_GRADES)),
+                    original_index[instr.id],
+                    instr.id,
+                ),
+            )
+
+    new_order = []
+    processed = set()
+    deferred = []
+
+    while heap:
+        grade, orig_idx, instr_id = heapq.heappop(heap)
+        instr = id_to_instr[instr_id]
+        scope = instr.scope_path
+        if is_fenced(scope) and scheduled_counts[scope] < preceding_counts[instr_id]:
+            deferred.append((grade, orig_idx, instr_id))
+            if not heap:
+                break
+            continue
+
+        new_order.append(instr_id)
+        processed.add(instr_id)
+        if is_fenced(scope):
+            scheduled_counts[scope] += 1
+
+        for item in deferred:
+            heapq.heappush(heap, item)
+        deferred.clear()
+
+        for succ in adjacency[instr_id]:
+            if succ in processed:
+                continue
+            dependencies[succ].discard(instr_id)
+            if not dependencies[succ]:
+                succ_instr = id_to_instr[succ]
+                heapq.heappush(
+                    heap,
+                    (
+                        grade_rank.get(
+                            succ_instr.grade, len(EFFECT_GRADES)
+                        ),
+                        original_index[succ],
+                        succ,
+                    ),
+                )
+
+    if len(new_order) != len(instructions):
+        return tir
+
+    new_positions = {iid: idx for idx, iid in enumerate(new_order)}
+
+    for src, dst in borrow_edges:
+        orig_src = original_index[src]
+        orig_dst = original_index[dst]
+        if orig_src == orig_dst:
+            continue
+        lower = min(orig_src, orig_dst)
+        upper = max(orig_src, orig_dst)
+        new_src = new_positions.get(src)
+        new_dst = new_positions.get(dst)
+        if new_src is None or new_dst is None:
+            return tir
+        if new_src >= new_dst:
+            return tir
+        for instr in instructions:
+            orig_idx = original_index[instr.id]
+            if lower < orig_idx < upper:
+                new_idx = new_positions.get(instr.id)
+                if new_idx is None or not (new_src < new_idx < new_dst):
+                    return tir
+
+    for scope, ids in scope_sequences.items():
+        if not is_fenced(scope):
+            continue
+        positions = [new_positions[iid] for iid in ids]
+        sorted_positions = sorted(positions)
+        if positions != sorted_positions:
+            return tir
+        start = sorted_positions[0]
+        if sorted_positions != list(range(start, start + len(sorted_positions))):
+            return tir
+
+    tir.instructions = [id_to_instr[i] for i in new_order]
     return tir
 
 
@@ -795,7 +988,7 @@ def inline_trivial_io(tir):
 def list_optimizers():
     return {
         "fold_constants": "Constant folding for pure ops",
-        "reorder_pure_ops": "Commute pure ops before impure ops",
+        "reorder_pure_ops": "Effect-sensitive reordering by grade",
         "inline_trivial_io": "Replace deterministic IO reads with constants",
     }
 
