@@ -8,7 +8,9 @@ from pathlib import Path
 
 
 def _script_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "scripts" / "generate_coverage_badge.py"
+    return (
+        Path(__file__).resolve().parents[1] / "scripts" / "generate_coverage_badge.py"
+    )
 
 
 def test_default_output_is_alongside_coverage_xml(tmp_path):
@@ -32,7 +34,9 @@ def test_default_output_is_alongside_coverage_xml(tmp_path):
 
     badge = coverage_xml.with_name("coverage.svg")
     assert badge.is_file(), "Badge should be generated next to the coverage XML"
-    assert not (working_directory / "coverage.svg").exists(), "Badge should not be written to CWD"
+    assert not (
+        working_directory / "coverage.svg"
+    ).exists(), "Badge should not be written to CWD"
 
     svg_contents = badge.read_text(encoding="utf-8")
     assert "coverage" in svg_contents
