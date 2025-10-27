@@ -114,3 +114,38 @@ def test_use_file_read_advances_contents(fresh_env):
     assert first.capability.generation == cap.generation + 1
     assert second.capability.state["index"] == 2
     assert not cap.is_active
+
+
+def test_capability_permission_subset_and_revocation():
+    cap = Capability("Demo", state={}, permissions={"read", "write"})
+
+    restricted = cap.evolve("restrict", permission_subset={"read"})
+
+    assert not cap.is_active
+    assert restricted.permissions == frozenset({"read"})
+    assert restricted.has_permission("read")
+    assert not restricted.has_permission("write")
+
+    with pytest.raises(ValueError):
+        restricted.evolve("expand", permission_subset={"read", "write"})
+
+    revoked = restricted.evolve("revoke", revoke=True)
+
+    assert not restricted.is_active
+    assert not revoked.is_active
+    assert revoked.revoked
+    assert not revoked.has_permission("read")
+
+    with pytest.raises(RuntimeError):
+        restricted.evolve("reuse")
+
+
+def test_capability_permission_checks_enforced():
+    writable = CAPABILITY_FACTORIES["FileWrite"]()
+    sandboxed = writable.evolve("sandbox", permission_subset=set())
+
+    assert sandboxed.permissions == frozenset()
+    assert not sandboxed.has_permission("write")
+
+    with pytest.raises(RuntimeError):
+        use_file_write(sandboxed, payload=1)
