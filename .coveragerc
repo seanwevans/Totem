@@ -1,6 +1,5 @@
 [run]
 source = totem
-branch = true
 
 [report]
 show_missing = true

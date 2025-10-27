@@ -124,3 +124,31 @@ def test_ffi_declaration_from_dict_supports_alias_keys():
     assert decl.return_type == "bytes"
     assert decl.capabilities == ["fs"]
     assert decl.arity == 1
+    assert decl.to_dict()["name"] == "ALIAS"
+
+
+def test_ffi_declaration_validation_errors():
+    with pytest.raises(ValueError):
+        FFIDeclaration("", "pure", [], "void")
+    with pytest.raises(ValueError):
+        FFIDeclaration("Z", "unknown", [], "void")
+    with pytest.raises(TypeError):
+        FFIDeclaration.from_dict(["not", "a", "mapping"])
+
+
+def test_normalize_ffi_handles_various_inputs():
+    clear_ffi_registry()
+    json_blob = json.dumps([
+        {"name": "JS", "grade": "pure"},
+        {"name": "JT", "grade": "state"},
+    ])
+    register_ffi_declarations(json_blob, reset=True)
+    assert "JS" in get_registered_ffi_declarations()
+
+    tuple_spec = (
+        FFIDeclaration("TU", "io", [], "void"),
+        {"name": "TV", "grade": "sys"},
+    )
+    register_ffi_declarations(tuple_spec)
+    registry = get_registered_ffi_declarations()
+    assert "TV" in registry and registry["TV"].grade == "sys"
