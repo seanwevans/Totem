@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import sys
 import xml.etree.ElementTree as ET
 
@@ -16,8 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "output",
         nargs="?",
-        default="coverage.svg",
-        help="Destination path for the generated badge (default: coverage.svg).",
+        help="Destination path for the generated badge (default: alongside the coverage XML).",
     )
     return parser.parse_args()
 
@@ -98,12 +98,17 @@ def render_svg(percentage: int) -> str:
 
 def main() -> int:
     args = parse_args()
-    percentage = load_coverage_percentage(args.coverage_xml)
+    coverage_xml = Path(args.coverage_xml)
+    if args.output is None:
+        output = coverage_xml.with_name("coverage.svg")
+    else:
+        output = Path(args.output)
+
+    percentage = load_coverage_percentage(str(coverage_xml))
     svg = render_svg(percentage)
 
-    args.output = args.output.strip()
-    with open(args.output, "w", encoding="utf-8") as fh:
-        fh.write(svg)
+    output = output.resolve()
+    output.write_text(svg, encoding="utf-8")
 
     return 0
 
