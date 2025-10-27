@@ -636,6 +636,17 @@ class TIRProgram:
         return "\n".join(map(str, self.instructions))
 
 
+@dataclass(frozen=True)
+class TranspilationResult:
+    """Result of lowering Totem source into Totem IR."""
+
+    source: str
+    tree: "Scope"
+    tir: TIRProgram
+    errors: tuple[str, ...]
+    optimized: bool
+
+
 def _mlir_type(typ):
     """Map Totem types to MLIR types."""
 
@@ -3002,6 +3013,41 @@ def optimize_tir(tir):
     schedule_effects(tir)
     inline_trivial_io(tir)
     return tir
+
+
+def transpile_totem_to_tir(src, *, optimize=True, ffi_decls=None):
+    """Lower Totem source into Totem IR, optionally applying optimizations."""
+
+    previous_registry = get_registered_ffi_declarations()
+    if ffi_decls is not None:
+        register_ffi_declarations(ffi_decls, reset=True)
+
+    try:
+        tree = structural_decompress(src)
+        errors: list[str] = []
+        check_aliasing(tree, errors)
+        check_lifetimes(tree, errors)
+        verify_ffi_calls(tree, errors)
+
+        tir = build_tir(tree)
+        if optimize:
+            optimize_tir(tir)
+
+        return TranspilationResult(
+            source=src,
+            tree=tree,
+            tir=tir,
+            errors=tuple(errors),
+            optimized=bool(optimize),
+        )
+    finally:
+        if ffi_decls is not None:
+            clear_ffi_registry()
+            for name, decl in previous_registry.items():
+                FFI_REGISTRY[name] = decl
+
+
+transpile_to_totem_ir = transpile_totem_to_tir
 
 
 def list_optimizers():
