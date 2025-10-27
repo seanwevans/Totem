@@ -53,9 +53,9 @@ except ModuleNotFoundError:  # pragma: no cover
 
 try:
     from cryptography.hazmat.primitives.asymmetric import rsa, padding
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes, serialization  # pragma: no cover
+    from cryptography.hazmat.backends import default_backend  # pragma: no cover
+    from cryptography.exceptions import InvalidSignature  # pragma: no cover
 except ImportError:  # pragma: no cover
     rsa = padding = hashes = serialization = default_backend = InvalidSignature = None
 
@@ -3358,5 +3358,5 @@ def main(args):  # pragma: no cover
 __all__ = [name for name in globals() if not name.startswith("_")]
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main(sys.argv[1:])
