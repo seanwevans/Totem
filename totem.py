@@ -938,6 +938,12 @@ def tir_to_wat(tir, capabilities=None):
 
     imports_needed = {}
 
+    value_producers = {}
+    for instr in tir.instructions:
+        value_producers[instr.id] = instr
+        if instr.produces:
+            value_producers[instr.produces] = instr
+
     for instr in tir.instructions:
         if instr.grade == "pure":
             local_name = declare_local(instr.id)
@@ -994,6 +1000,22 @@ def tir_to_wat(tir, capabilities=None):
                 dep_local = alias_map.get(target)
                 if dep_local:
                     call_operands.append(f"(local.get {dep_local})")
+                else:
+                    producer = value_producers.get(target)
+                    if producer:
+                        raise ValueError(
+                            "IO operation "
+                            f"{instr.op} argument {target} depends on "
+                            f"{producer.op} [{producer.grade}], which cannot be lowered to WebAssembly"
+                        )
+                    elif isinstance(target, str):
+                        raise ValueError(
+                            f"IO operation {instr.op} has unknown dependency {target}"
+                        )
+                    else:
+                        raise ValueError(
+                            f"IO operation {instr.op} received unsupported operand {arg}"
+                        )
 
             if call_operands:
                 call_expr = (
