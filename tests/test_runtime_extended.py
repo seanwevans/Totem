@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from optional_deps import requires_no_pydot, requires_no_visualization
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import totem.runtime as runtime_module
@@ -361,11 +363,18 @@ def test_logbook_display(monkeypatch, tmp_path, capsys):
     assert "a.totem.json" in second_output
 
 
+@requires_no_visualization
 def test_visualization_guards():
     tree, errors, _ = compile_and_evaluate("{ad}")
     assert not errors
     with pytest.raises(RuntimeError):
         visualize_graph(tree)
+
+
+@requires_no_pydot
+def test_graphviz_export_guard():
+    tree, errors, _ = compile_and_evaluate("{ad}")
+    assert not errors
     with pytest.raises(ModuleNotFoundError):
         export_graphviz(tree, "out.svg")
 
