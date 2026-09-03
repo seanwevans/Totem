@@ -7,7 +7,12 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from ..constants import EFFECT_GRADES, IO_IMPORTS, PURE_CONST_VALUES
+from ..constants import (
+    EFFECT_GRADES,
+    IO_IMPORTS,
+    PURE_CONST_VALUES,
+    PURE_DEFAULT_VALUE,
+)
 from ..ffi import (
     FFI_REGISTRY,
     FFIDeclaration,
@@ -308,8 +313,8 @@ def tir_to_wat(tir, capabilities=None):
             local_name = declare_local(instr.id)
             bind_aliases(instr, local_name)
 
-            if instr.op in {"A", "D", "F"}:
-                const_val = {"A": 1, "D": 2, "F": 5}[instr.op]
+            if instr.op in PURE_CONST_VALUES:
+                const_val = PURE_CONST_VALUES[instr.op]
                 body_lines.append(f"(local.set {local_name} (i32.const {const_val}))")
             elif instr.op == "CONST" and hasattr(instr, "value"):
                 body_lines.append(
@@ -333,8 +338,14 @@ def tir_to_wat(tir, capabilities=None):
                         f"(i32.add (local.get {dep_local}) (i32.const 3)))"
                     )
             else:
-                raise NotImplementedError(
-                    f"Pure operation {instr.op} is not supported for WASM lowering"
+                # Every remaining pure opcode denotes PURE_DEFAULT_VALUE. Both
+                # interpreters already fall back to 0 for an opcode they have
+                # no rule for (analysis.evaluate_node returns lift(0),
+                # BytecodeVM._apply_operation returns 0), so the WASM backend
+                # agrees with them rather than refusing to lower. Pure lowering
+                # is total: no opcode raises NotImplementedError.
+                body_lines.append(
+                    f"(local.set {local_name} (i32.const {PURE_DEFAULT_VALUE}))"
                 )
             last_pure_local = local_name
         elif instr.grade == "io":

@@ -73,3 +73,67 @@ def test_borrowed_e_still_adds_three():
 
     assert "i32.add" in wat
     assert "(i32.const 3)" in wat
+
+
+ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+ALL_CAPABILITIES = {"io.read", "io.write"}
+
+
+@pytest.mark.parametrize("letter", list(ALPHABET))
+def test_every_single_letter_program_lowers(letter):
+    """Totality: all 26 one-byte programs produce a module."""
+
+    wat, _ = tir_to_wat(
+        build_tir(structural_decompress(letter)), capabilities=ALL_CAPABILITIES
+    )
+    assert wat.startswith("(module")
+    assert "(func $run" in wat
+
+
+def test_pure_lowering_never_raises_not_implemented():
+    """No pure opcode is missing from the lowering."""
+
+    for letter in ALPHABET:
+        tir = build_tir(structural_decompress(letter))
+        for instr in tir.instructions:
+            if instr.grade != "pure":
+                continue
+            tir_to_wat(tir, capabilities=ALL_CAPABILITIES)
+
+
+def test_undefined_pure_ops_lower_to_the_interpreter_fallback():
+    """Pure ops with no rule denote 0, the value both interpreters give them."""
+
+    from totem import assemble_bytecode, run_bytecode
+    from totem.constants import PURE_DEFAULT_VALUE
+
+    for letter in "irtuvwxyz":
+        tir = build_tir(structural_decompress(letter))
+        wat, _ = tir_to_wat(tir)
+
+        assert f"(i32.const {PURE_DEFAULT_VALUE})" in wat
+        assert run_bytecode(assemble_bytecode(tir)).stack == [PURE_DEFAULT_VALUE]
+
+
+def test_named_pure_constants_keep_their_values():
+    from totem.constants import PURE_CONST_VALUES
+
+    for letter, value in [("a", 1), ("d", 2), ("f", 5)]:
+        wat, _ = tir_to_wat(build_tir(structural_decompress(letter)))
+        assert f"(i32.const {value})" in wat
+        assert PURE_CONST_VALUES[letter.upper()] == value
+
+
+def test_cross_grade_dependencies_are_still_refused():
+    """A pure op borrowing a state/sys/meta value is rejected, not faked.
+
+    WebAssembly cannot compute those values, so substituting a placeholder
+    would be a silent semantic lie. This boundary is deliberate and separate
+    from opcode coverage.
+    """
+
+    with pytest.raises(ValueError, match="Unknown borrow target"):
+        tir_to_wat(build_tir(structural_decompress("be")))
+
+    with pytest.raises(ValueError, match="cannot be lowered to WebAssembly"):
+        tir_to_wat(build_tir(structural_decompress("bg")), capabilities={"io.write"})
