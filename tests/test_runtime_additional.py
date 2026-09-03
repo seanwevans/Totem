@@ -127,9 +127,10 @@ def test_repr_helpers_and_meta_objects():
 
 
 def test_structural_decompress_error_paths():
-    with pytest.raises(ValueError):
-        structural_decompress("}")
+    # Fence imbalance is not an error: a stray closer is ignored.
+    assert structural_decompress("}").nodes == []
 
+    # Grade violations inside a fence are still rejected.
     with pytest.raises(ValueError):
         structural_decompress("(c")
 
@@ -474,8 +475,10 @@ def test_irnode_and_emitters_cover_branches():
 
 
 def test_structural_decompress_additional_errors():
-    with pytest.raises(ValueError):
-        structural_decompress("{)")
+    # A closer that does not match the innermost fence is ignored, and the
+    # fence it failed to close is closed implicitly at end of input.
+    root = structural_decompress("{)")
+    assert [child.fence for child in root.children] == ["{}"]
 
     root, first, _, _ = make_scope_with_borrow()
     another = Node("C", "int32", root)
