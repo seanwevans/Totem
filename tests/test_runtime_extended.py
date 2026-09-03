@@ -273,10 +273,12 @@ def test_continuous_semantics_profile_handles_mutations():
     assert all(entry["index"] >= 0 for entry in profile)
     assert any("distance" in entry for entry in profile)
 
+    # Fence imbalance no longer aborts a mutation, but a grade violation does.
+    fenced_src = "(ad)"
     error_profile = continuous_semantics_profile(
-        src,
-        base_tir=base_tir,
-        mutate_fn=lambda _ch: "x",
+        fenced_src,
+        base_tir=build_tir(structural_decompress(fenced_src)),
+        mutate_fn=lambda _ch: "c",
     )
     assert any(entry.get("error") for entry in error_profile)
 
@@ -399,10 +401,14 @@ def test_build_bitcode_certificates_failures():
 
 
 def test_structural_decompress_error_paths():
-    with pytest.raises(ValueError):
-        structural_decompress("}")
-    with pytest.raises(ValueError):
-        structural_decompress("{a")
+    # Unbalanced fences are total: stray closers are dropped and open fences
+    # are closed at end of input.
+    assert structural_decompress("}").children == []
+
+    root = structural_decompress("{a")
+    scope = root.children[0]
+    assert [node.op for node in scope.nodes] == ["A"]
+    assert scope.drops == scope.lifetimes == [scope.nodes[0].owned_life]
 
 
 def test_explain_grade_and_borrow():

@@ -14,6 +14,7 @@ from totem import (
     build_tir,
     compute_tir_distance,
     continuous_semantics_profile,
+    _rejection_distance,
     evaluate_scope,
     ActorSystem,
     OwnedMessage,
@@ -296,3 +297,104 @@ def test_bytecode_vm_matches_scope_evaluation(sample_root):
 
     assert vm_result.grade == scope_result.grade
     assert vm_result.log == scope_result.log
+
+
+FENCE_CHARS = "{}()[]<>"
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "",
+        "}",
+        ")",
+        "]]]",
+        "a]",
+        "{a",
+        "{a}}",
+        "{)",
+        "(a]",
+        "<{a>",
+        "{{{ad",
+        "}{ad}{",
+    ],
+)
+def test_unbalanced_fences_still_compile(src):
+    """Fence imbalance never aborts structural decompression."""
+
+    tir = build_tir(structural_decompress(src))
+    # Every alphabetic byte still contributes exactly one instruction.
+    assert len(tir.instructions) == sum(ch.isalpha() for ch in src)
+
+
+def test_stray_closers_are_dropped():
+    """A closer with no matching open fence leaves the tree unchanged."""
+
+    balanced = structural_decompress("{ad}")
+    stray = structural_decompress("}{ad}]")
+
+    assert len(stray.children) == len(balanced.children) == 1
+    assert [n.op for n in stray.children[0].nodes] == ["A", "D"]
+
+
+def test_open_fences_are_closed_at_eof():
+    """Implicitly closed fences end their nodes' lifetimes like explicit ones."""
+
+    implicit = structural_decompress("{ad").children[0]
+    explicit = structural_decompress("{ad}").children[0]
+
+    assert [life.id for life in implicit.drops] == [life.id for life in explicit.drops]
+    assert all(life.end_scope is implicit for life in implicit.lifetimes)
+
+
+def test_every_fence_permutation_compiles():
+    """Exhaustive check over short fence-only strings: none raise."""
+
+    for first in FENCE_CHARS:
+        for second in FENCE_CHARS:
+            for third in FENCE_CHARS:
+                structural_decompress(first + second + third)
+
+
+def test_rejected_mutations_are_never_distance_zero():
+    """A mutation the front end rejects must not read as semantically identical."""
+
+    src = "(ad)"
+    profile = continuous_semantics_profile(src, mutate_fn=lambda _ch: "c")
+    rejected = [entry for entry in profile if not entry["compiles"]]
+
+    assert rejected, "expected at least one rejected mutant"
+    for entry in rejected:
+        assert entry["error"]
+        assert entry["distance"]["total"] > 0
+
+
+def test_profile_marks_every_entry_with_compiles():
+    profile = continuous_semantics_profile("{ab}")
+    assert profile
+    assert all("compiles" in entry for entry in profile)
+    assert all(entry["compiles"] for entry in profile)
+
+
+def test_rejection_distance_has_a_floor_for_empty_programs():
+    """An empty base program must still rank a rejected mutant above zero."""
+
+    empty = build_tir(structural_decompress(""))
+    assert not empty.instructions
+    assert _rejection_distance(empty)["total"] >= 1
+
+
+def test_unbalanced_mutations_are_measured_not_swallowed():
+    """Brace-unbalancing mutations now produce real distances, not zeros."""
+
+    src = "{ad}"
+    base = build_tir(structural_decompress(src))
+    profile = continuous_semantics_profile(
+        src, base_tir=base, mutate_fn=lambda _ch: "}"
+    )
+
+    # Mutating '{' to '}' drops the fence entirely; the scope path of every
+    # instruction changes, so the distance must be non-zero.
+    opened = next(entry for entry in profile if entry["index"] == 0)
+    assert opened["compiles"]
+    assert opened["distance"]["total"] > 0

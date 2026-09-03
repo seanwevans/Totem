@@ -7,7 +7,12 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from ..constants import EFFECT_GRADES, IO_IMPORTS, PURE_CONST_VALUES
+from ..constants import (
+    EFFECT_GRADES,
+    IO_IMPORTS,
+    PURE_CONST_VALUES,
+    PURE_DEFAULT_VALUE,
+)
 from ..ffi import (
     FFI_REGISTRY,
     FFIDeclaration,
@@ -23,7 +28,7 @@ from .analysis import (
     verify_ffi_calls,
 )
 from .core import Scope
-from .tir import TIRInstruction, TIRProgram, TranspilationResult
+from .tir import TIRInstruction, TIRProgram, TranspilationResult, as_tir_program
 
 
 def build_tir(scope, program=None, prefix="root", include_attached=False):
@@ -131,6 +136,9 @@ def compute_tir_distance(tir_a, tir_b):
     stable measure of how far two programs diverge semantically.
     """
 
+    tir_a = as_tir_program(tir_a)
+    tir_b = as_tir_program(tir_b)
+
     def map_instructions(tir):
         mapping = {}
         scope_counters = {}
@@ -203,12 +211,37 @@ def _mutate_byte(ch):
     return chr((code + 1) % 0x110000)
 
 
+def _rejection_distance(base_tir):
+    """Distance recorded for a mutant the front end refuses to compile.
+
+    A rejected mutant has no program to compare against, so every instruction
+    of the base program is treated as deleted. The floor of 1 keeps a rejected
+    mutant strictly farther from the base than an accepted identical one, even
+    when the base program is empty — scoring rejection as distance 0 would make
+    the metric blind exactly at the boundary cases it exists to measure.
+    """
+
+    node_edits = max(len(base_tir.instructions), 1)
+    return {
+        "node_edits": node_edits,
+        "grade_delta": 0,
+        "op_changes": 0,
+        "type_changes": 0,
+        "borrow_rewires": 0,
+        "total": node_edits,
+    }
+
+
 def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
     """Measure how semantics shift under single-byte mutations.
 
     Each byte is rotated to the next printable ASCII character (configurable
     via ``mutate_fn``). We rebuild the TIR for the mutated source and compute
     the semantic distance against ``base_tir``.
+
+    Every entry carries a ``compiles`` flag. When a mutant is rejected the
+    entry also carries ``error`` and its distance is the rejection distance
+    described in :func:`_rejection_distance`, never zero.
     """
 
     mutate_fn = mutate_fn or _mutate_byte
@@ -224,21 +257,14 @@ def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
         try:
             mutated_tree = structural_decompress(mutated_src)
         except ValueError as exc:
-            dist = {
-                "node_edits": 0,
-                "grade_delta": 0,
-                "op_changes": 0,
-                "type_changes": 0,
-                "borrow_rewires": 0,
-                "total": 0,
-            }
             profile.append(
                 {
                     "index": idx,
                     "original": ch,
                     "mutated": mutated_char,
                     "mutated_src": mutated_src,
-                    "distance": dist,
+                    "distance": _rejection_distance(base_tir),
+                    "compiles": False,
                     "error": str(exc),
                 }
             )
@@ -252,6 +278,7 @@ def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
                 "mutated": mutated_char,
                 "mutated_src": mutated_src,
                 "distance": dist,
+                "compiles": True,
             }
         )
 
@@ -272,8 +299,12 @@ def tir_to_wat(tir, capabilities=None):
     Only pure instructions are lowered to direct WebAssembly operations. IO-grade
     instructions are exposed as host imports and require the caller to provide
     the corresponding capability string (e.g. ``io.read``).
+
+    ``tir`` may be a :class:`TIRProgram` or the :class:`TranspilationResult`
+    returned by :func:`transpile_totem_to_tir`.
     """
 
+    tir = as_tir_program(tir)
     capabilities = set(capabilities or [])
     required_capabilities = []
 
@@ -308,27 +339,39 @@ def tir_to_wat(tir, capabilities=None):
             local_name = declare_local(instr.id)
             bind_aliases(instr, local_name)
 
-            if instr.op in {"A", "D", "F"}:
-                const_val = {"A": 1, "D": 2, "F": 5}[instr.op]
+            if instr.op in PURE_CONST_VALUES:
+                const_val = PURE_CONST_VALUES[instr.op]
                 body_lines.append(f"(local.set {local_name} (i32.const {const_val}))")
             elif instr.op == "CONST" and hasattr(instr, "value"):
                 body_lines.append(
                     f"(local.set {local_name} (i32.const {int(instr.value)}))"
                 )
             elif instr.op == "E":
+                # E adds 3 to its borrowed operand. With no borrow the operand
+                # is the additive identity, so E denotes 3 — matching what both
+                # the tree evaluator and the bytecode VM already produce. A
+                # one-byte program must compile, so this cannot be an error.
                 if not instr.args:
-                    raise ValueError("E operation expects at least one borrow argument")
-                arg = instr.args[0]
-                target = arg.get("target") if isinstance(arg, dict) else arg
-                dep_local = alias_map.get(target)
-                if not dep_local:
-                    raise ValueError(f"Unknown borrow target {target} for op E")
-                body_lines.append(
-                    f"(local.set {local_name} (i32.add (local.get {dep_local}) (i32.const 3)))"
-                )
+                    body_lines.append(f"(local.set {local_name} (i32.const 3))")
+                else:
+                    arg = instr.args[0]
+                    target = arg.get("target") if isinstance(arg, dict) else arg
+                    dep_local = alias_map.get(target)
+                    if not dep_local:
+                        raise ValueError(f"Unknown borrow target {target} for op E")
+                    body_lines.append(
+                        f"(local.set {local_name} "
+                        f"(i32.add (local.get {dep_local}) (i32.const 3)))"
+                    )
             else:
-                raise NotImplementedError(
-                    f"Pure operation {instr.op} is not supported for WASM lowering"
+                # Every remaining pure opcode denotes PURE_DEFAULT_VALUE. Both
+                # interpreters already fall back to 0 for an opcode they have
+                # no rule for (analysis.evaluate_node returns lift(0),
+                # BytecodeVM._apply_operation returns 0), so the WASM backend
+                # agrees with them rather than refusing to lower. Pure lowering
+                # is total: no opcode raises NotImplementedError.
+                body_lines.append(
+                    f"(local.set {local_name} (i32.const {PURE_DEFAULT_VALUE}))"
                 )
             last_pure_local = local_name
         elif instr.grade == "io":
@@ -859,8 +902,13 @@ def inline_trivial_io(tir):
 
 
 def optimize_tir(tir):
-    """Run the full suite of optimizer passes."""
+    """Run the full suite of optimizer passes.
 
+    Accepts a :class:`TIRProgram` or a :class:`TranspilationResult`; the
+    program is optimized in place and returned.
+    """
+
+    tir = as_tir_program(tir)
     fold_constants(tir)
     evaluate_pure_regions(tir)
     common_subexpression_elimination(tir)
@@ -954,6 +1002,7 @@ __all__ = [
     "_normalize_args",
     "compute_tir_distance",
     "_mutate_byte",
+    "_rejection_distance",
     "continuous_semantics_profile",
     "_wasm_local_name",
     "_format_wasm_list",
