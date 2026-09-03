@@ -279,8 +279,9 @@ def test_tir_to_wat_errors_and_export(temp_dir):
     tir = TIRProgram()
     pure_instr = TIRInstruction("v0", "E", "int32", "pure", [], "root")
     tir.instructions.append(pure_instr)
-    with pytest.raises(ValueError):
-        tir_to_wat(tir)
+    # E with no borrows is defined, not an error.
+    wat, _ = tir_to_wat(tir)
+    assert "(i32.const 3)" in wat
 
     pure_instr.args = ["unknown"]
     with pytest.raises(ValueError):
@@ -290,9 +291,11 @@ def test_tir_to_wat_errors_and_export(temp_dir):
     with pytest.raises(ValueError):
         tir_to_wat(tir)
 
+    # Pure lowering is total: an opcode with no rule of its own denotes 0.
     pure_instr.op = "Z"
-    with pytest.raises(NotImplementedError):
-        tir_to_wat(tir)
+    pure_instr.args = []
+    wat, _ = tir_to_wat(tir)
+    assert "(i32.const 0)" in wat
 
     io_instr = TIRInstruction("v1", "G", "int32", "io", [{"target": "v0"}], "root")
     tir.instructions = [
