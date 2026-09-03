@@ -49,6 +49,11 @@ IO_IMPORTS = {
 
 PURE_CONST_VALUES = {"A": 1, "D": 2, "F": 5}
 
+# Value denoted by a pure opcode with no rule of its own. Both interpreters
+# already fall back to this, so backends stay in agreement and lowering stays
+# total over the whole alphabet.
+PURE_DEFAULT_VALUE = 0
+
 LOGBOOK_FILE = "totem.logbook.jsonl"
 KEY_FILE = "totem_private_key.pem"
 PUB_FILE = "totem_public_key.pem"
@@ -66,6 +71,7 @@ __all__ = [
     "OPS",
     "IO_IMPORTS",
     "PURE_CONST_VALUES",
+    "PURE_DEFAULT_VALUE",
     "PURE_CONSTANTS",
     "LOGBOOK_FILE",
     "KEY_FILE",
