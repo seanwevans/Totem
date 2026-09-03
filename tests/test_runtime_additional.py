@@ -279,8 +279,9 @@ def test_tir_to_wat_errors_and_export(temp_dir):
     tir = TIRProgram()
     pure_instr = TIRInstruction("v0", "E", "int32", "pure", [], "root")
     tir.instructions.append(pure_instr)
-    with pytest.raises(ValueError):
-        tir_to_wat(tir)
+    # E with no borrows is defined, not an error.
+    wat, _ = tir_to_wat(tir)
+    assert "(i32.const 3)" in wat
 
     pure_instr.args = ["unknown"]
     with pytest.raises(ValueError):
