@@ -208,12 +208,37 @@ def _mutate_byte(ch):
     return chr((code + 1) % 0x110000)
 
 
+def _rejection_distance(base_tir):
+    """Distance recorded for a mutant the front end refuses to compile.
+
+    A rejected mutant has no program to compare against, so every instruction
+    of the base program is treated as deleted. The floor of 1 keeps a rejected
+    mutant strictly farther from the base than an accepted identical one, even
+    when the base program is empty — scoring rejection as distance 0 would make
+    the metric blind exactly at the boundary cases it exists to measure.
+    """
+
+    node_edits = max(len(base_tir.instructions), 1)
+    return {
+        "node_edits": node_edits,
+        "grade_delta": 0,
+        "op_changes": 0,
+        "type_changes": 0,
+        "borrow_rewires": 0,
+        "total": node_edits,
+    }
+
+
 def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
     """Measure how semantics shift under single-byte mutations.
 
     Each byte is rotated to the next printable ASCII character (configurable
     via ``mutate_fn``). We rebuild the TIR for the mutated source and compute
     the semantic distance against ``base_tir``.
+
+    Every entry carries a ``compiles`` flag. When a mutant is rejected the
+    entry also carries ``error`` and its distance is the rejection distance
+    described in :func:`_rejection_distance`, never zero.
     """
 
     mutate_fn = mutate_fn or _mutate_byte
@@ -229,21 +254,14 @@ def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
         try:
             mutated_tree = structural_decompress(mutated_src)
         except ValueError as exc:
-            dist = {
-                "node_edits": 0,
-                "grade_delta": 0,
-                "op_changes": 0,
-                "type_changes": 0,
-                "borrow_rewires": 0,
-                "total": 0,
-            }
             profile.append(
                 {
                     "index": idx,
                     "original": ch,
                     "mutated": mutated_char,
                     "mutated_src": mutated_src,
-                    "distance": dist,
+                    "distance": _rejection_distance(base_tir),
+                    "compiles": False,
                     "error": str(exc),
                 }
             )
@@ -257,6 +275,7 @@ def continuous_semantics_profile(src, base_tir=None, mutate_fn=None):
                 "mutated": mutated_char,
                 "mutated_src": mutated_src,
                 "distance": dist,
+                "compiles": True,
             }
         )
 
@@ -971,6 +990,7 @@ __all__ = [
     "_normalize_args",
     "compute_tir_distance",
     "_mutate_byte",
+    "_rejection_distance",
     "continuous_semantics_profile",
     "_wasm_local_name",
     "_format_wasm_list",
