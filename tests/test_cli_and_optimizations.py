@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from optional_deps import requires_no_cryptography, requires_no_visualization
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -110,6 +111,7 @@ def test_bitcode_hash_diff_logbook_and_reexecution(tmp_path, capsys, monkeypatch
     assert "Loaded Totem Bitcode" in reexec_output
 
 
+@requires_no_cryptography
 def test_crypto_helpers_require_dependencies():
     with pytest.raises(RuntimeError):
         runtime.ensure_keypair()
@@ -119,6 +121,24 @@ def test_crypto_helpers_require_dependencies():
 
     with pytest.raises(RuntimeError):
         runtime.verify_signature("deadbeef", "cafebabe")
+
+
+def test_crypto_helpers_report_missing_dependencies(monkeypatch):
+    """The guards themselves are checked without uninstalling cryptography."""
+
+    from totem.runtime import crypto
+
+    for name in ("rsa", "padding", "hashes", "serialization", "default_backend"):
+        monkeypatch.setattr(crypto, name, None, raising=False)
+    monkeypatch.setattr(crypto, "InvalidSignature", None, raising=False)
+
+    for call in (
+        lambda: crypto.ensure_keypair(),
+        lambda: crypto.sign_hash("deadbeef"),
+        lambda: crypto.verify_signature("deadbeef", "cafebabe"),
+    ):
+        with pytest.raises(RuntimeError, match="Cryptography support is unavailable"):
+            call()
 
 
 def test_main_argument_branches(monkeypatch, capsys):
@@ -368,6 +388,19 @@ def test_export_graphviz_with_stub(monkeypatch, tmp_path):
     assert output.read_text(encoding="utf-8") == "<svg/>"
 
 
+@requires_no_visualization
 def test_visualize_graph_requires_optional_dependencies():
     with pytest.raises(RuntimeError):
         runtime.visualize_graph(structural_decompress("{a}"))
+
+
+def test_visualize_graph_reports_missing_dependencies(monkeypatch):
+    """The guard itself is checked without uninstalling networkx."""
+
+    from totem.runtime import analysis
+
+    monkeypatch.setattr(analysis, "nx", None, raising=False)
+    monkeypatch.setattr(analysis, "plt", None, raising=False)
+
+    with pytest.raises(RuntimeError, match="requires networkx and matplotlib"):
+        analysis.visualize_graph(structural_decompress("{a}"))
