@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from optional_deps import HAS_CRYPTOGRAPHY
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import totem.runtime as runtime_mod
@@ -241,8 +243,13 @@ def test_bitcode_round_trip_and_logging(temp_dir, capsys):
     out = capsys.readouterr().out
     assert "Bitcodes differ" in out
 
-    with pytest.raises(RuntimeError):
-        record_run(str(bitcode_path), result)
+    if not HAS_CRYPTOGRAPHY:
+        # Without the optional dependency, signing the run must fail loudly.
+        # With it installed, record_run succeeds and writes a keypair into the
+        # working directory, so it is not called here at all.
+        with pytest.raises(RuntimeError):
+            record_run(str(bitcode_path), result)
+
     entry = {
         "timestamp": "2024-01-01T00:00:00Z",
         "filename": str(bitcode_path),
