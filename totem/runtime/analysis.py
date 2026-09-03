@@ -64,7 +64,13 @@ from .tir import TIRProgram, assemble_bytecode, run_bytecode
 
 
 def structural_decompress(src):
-    """Build scope tree and typed node graph from raw characters."""
+    """Build scope tree and typed node graph from raw characters.
+
+    Fencing is total: every input denotes a program. Fences still open at the
+    end of the input are closed implicitly, and a closer that matches no open
+    fence — either because nothing is open or because the innermost fence was
+    opened with a different bracket — is ignored.
+    """
 
     def combine_caps(parent_cap, new_cap):
         if parent_cap is None:
@@ -88,6 +94,18 @@ def structural_decompress(src):
 
     closers = {info["close"]: opener for opener, info in openers.items()}
 
+    def close_scope(scope):
+        """Finalise a scope's lifetimes and return the new ``last_node``."""
+
+        for n in scope.nodes:
+            n.owned_life.end_scope = scope
+            scope.lifetimes.append(n.owned_life)
+            scope.drops.append(n.owned_life)
+        parent_scope = scope.parent
+        if parent_scope and parent_scope.nodes:
+            return parent_scope.nodes[-1]
+        return None
+
     for ch in src:
         current = stack[-1][0]
 
@@ -110,22 +128,13 @@ def structural_decompress(src):
                 s.meta_role = "attached"
             stack.append((s, info["close"], ch))
         elif ch in closers:
-            if len(stack) == 1:
-                raise ValueError(f"Unmatched closing fence '{ch}'")
-            scope, expected, opener = stack.pop()
-            if ch != expected:
-                raise ValueError(
-                    f"Mismatched fence: opened with '{opener}' but closed with '{ch}'"
-                )
-            for n in scope.nodes:
-                n.owned_life.end_scope = scope
-                scope.lifetimes.append(n.owned_life)
-                scope.drops.append(n.owned_life)
-            parent_scope = scope.parent
-            if parent_scope and parent_scope.nodes:
-                last_node = parent_scope.nodes[-1]
-            else:
-                last_node = None
+            # A closer only closes the fence it actually matches. A stray or
+            # mismatched closer is a no-op rather than an error, so that every
+            # byte string denotes a program.
+            if len(stack) == 1 or ch != stack[-1][1]:
+                continue
+            scope, _expected, _opener = stack.pop()
+            last_node = close_scope(scope)
         elif ch.isalpha():
             node = Node(op=ch.upper(), typ="int32", scope=current)
             cap = current.effect_cap
@@ -147,9 +156,10 @@ def structural_decompress(src):
             node.update_type()
             last_node = node
 
-    if len(stack) != 1:
-        _, expected, opener = stack[-1]
-        raise ValueError(f"Unclosed fence '{opener}' expected '{expected}'")
+    # Fences left open at end of input are closed implicitly, innermost first.
+    while len(stack) > 1:
+        scope, _expected, _opener = stack.pop()
+        last_node = close_scope(scope)
 
     return root
 

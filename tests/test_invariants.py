@@ -296,3 +296,60 @@ def test_bytecode_vm_matches_scope_evaluation(sample_root):
 
     assert vm_result.grade == scope_result.grade
     assert vm_result.log == scope_result.log
+
+
+FENCE_CHARS = "{}()[]<>"
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "",
+        "}",
+        ")",
+        "]]]",
+        "a]",
+        "{a",
+        "{a}}",
+        "{)",
+        "(a]",
+        "<{a>",
+        "{{{ad",
+        "}{ad}{",
+    ],
+)
+def test_unbalanced_fences_still_compile(src):
+    """Fence imbalance never aborts structural decompression."""
+
+    tir = build_tir(structural_decompress(src))
+    # Every alphabetic byte still contributes exactly one instruction.
+    assert len(tir.instructions) == sum(ch.isalpha() for ch in src)
+
+
+def test_stray_closers_are_dropped():
+    """A closer with no matching open fence leaves the tree unchanged."""
+
+    balanced = structural_decompress("{ad}")
+    stray = structural_decompress("}{ad}]")
+
+    assert len(stray.children) == len(balanced.children) == 1
+    assert [n.op for n in stray.children[0].nodes] == ["A", "D"]
+
+
+def test_open_fences_are_closed_at_eof():
+    """Implicitly closed fences end their nodes' lifetimes like explicit ones."""
+
+    implicit = structural_decompress("{ad").children[0]
+    explicit = structural_decompress("{ad}").children[0]
+
+    assert [life.id for life in implicit.drops] == [life.id for life in explicit.drops]
+    assert all(life.end_scope is implicit for life in implicit.lifetimes)
+
+
+def test_every_fence_permutation_compiles():
+    """Exhaustive check over short fence-only strings: none raise."""
+
+    for first in FENCE_CHARS:
+        for second in FENCE_CHARS:
+            for third in FENCE_CHARS:
+                structural_decompress(first + second + third)
