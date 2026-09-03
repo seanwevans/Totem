@@ -23,7 +23,7 @@ from .analysis import (
     verify_ffi_calls,
 )
 from .core import Scope
-from .tir import TIRInstruction, TIRProgram, TranspilationResult
+from .tir import TIRInstruction, TIRProgram, TranspilationResult, as_tir_program
 
 
 def build_tir(scope, program=None, prefix="root", include_attached=False):
@@ -130,6 +130,9 @@ def compute_tir_distance(tir_a, tir_b):
     The total distance is the sum of the components. This yields a coarse yet
     stable measure of how far two programs diverge semantically.
     """
+
+    tir_a = as_tir_program(tir_a)
+    tir_b = as_tir_program(tir_b)
 
     def map_instructions(tir):
         mapping = {}
@@ -272,8 +275,12 @@ def tir_to_wat(tir, capabilities=None):
     Only pure instructions are lowered to direct WebAssembly operations. IO-grade
     instructions are exposed as host imports and require the caller to provide
     the corresponding capability string (e.g. ``io.read``).
+
+    ``tir`` may be a :class:`TIRProgram` or the :class:`TranspilationResult`
+    returned by :func:`transpile_totem_to_tir`.
     """
 
+    tir = as_tir_program(tir)
     capabilities = set(capabilities or [])
     required_capabilities = []
 
@@ -859,8 +866,13 @@ def inline_trivial_io(tir):
 
 
 def optimize_tir(tir):
-    """Run the full suite of optimizer passes."""
+    """Run the full suite of optimizer passes.
 
+    Accepts a :class:`TIRProgram` or a :class:`TranspilationResult`; the
+    program is optimized in place and returned.
+    """
+
+    tir = as_tir_program(tir)
     fold_constants(tir)
     evaluate_pure_regions(tir)
     common_subexpression_elimination(tir)

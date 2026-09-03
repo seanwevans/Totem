@@ -143,6 +143,32 @@ class TranspilationResult:
     optimized: bool
 
 
+def as_tir_program(tir):
+    """Return the :class:`TIRProgram` carried by ``tir``.
+
+    ``transpile_totem_to_tir`` returns a :class:`TranspilationResult`, while
+    every TIR consumer wants the program itself. Accepting both here lets the
+    two public entry points compose — ``tir_to_wat(transpile_totem_to_tir(src))``
+    works without the caller having to know to reach for ``.tir``.
+
+    Anything else exposing an ``instructions`` attribute is passed through
+    unchanged, so hand-built and stubbed programs keep working.
+    """
+
+    if isinstance(tir, TranspilationResult):
+        return tir.tir
+    if hasattr(tir, "instructions"):
+        return tir
+
+    nested = getattr(tir, "tir", None)
+    if nested is not None and hasattr(nested, "instructions"):
+        return nested
+
+    raise TypeError(
+        "expected a TIRProgram or TranspilationResult, got " f"{type(tir).__name__}"
+    )
+
+
 def _mlir_type(typ):
     """Map Totem types to MLIR types."""
 
@@ -157,6 +183,8 @@ def _mlir_type(typ):
 
 def emit_mlir_module(tir):
     """Lower a TIR program to a textual MLIR module."""
+
+    tir = as_tir_program(tir)
 
     lattice = ", ".join(f'"{grade}"' for grade in EFFECT_GRADES)
     lines = [
@@ -226,6 +254,7 @@ PURE_CONSTANTS = {
 def emit_llvm_ir(tir):
     """Emit a simple LLVM IR view for the pure portion of a TIR program."""
 
+    tir = as_tir_program(tir)
     pure_instrs = [instr for instr in tir.instructions if instr.grade == "pure"]
     if not pure_instrs:
         return "; Totem program has no pure segment to lower"
@@ -398,6 +427,7 @@ class BytecodeVM:
 def assemble_bytecode(tir):
     """Linearise a TIR program into bytecode instructions."""
 
+    tir = as_tir_program(tir)
     program = BytecodeProgram()
     for instr in tir.instructions:
         args = []
@@ -429,6 +459,7 @@ __all__ = [
     "TIRProgram",
     "TranspilationResult",
     "_mlir_type",
+    "as_tir_program",
     "assemble_bytecode",
     "emit_llvm_ir",
     "emit_mlir_module",
